@@ -47,6 +47,8 @@ class Technique(Enum):
     BEND = "bend"
     VIBRATO = "vibrato"
 
+# ^ means "bend fully up to the next note" — this is a special case of bend that doesn't have a target fret number. 
+# It's not handled in the current parser, but could be added later if needed. For now, it will be ignored and treated as a normal note.
 
 # Characters that describe the TRANSITION into the next note on the same
 # string (i.e. they sit between two fret numbers and modify the second one).
