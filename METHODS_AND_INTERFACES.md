@@ -110,6 +110,18 @@ be reachable by one hand at once. So the graph's nodes have to be
   across both notes together, then throws out any combination that
   reuses a finger, or assigns an open-string note (fret 0) a finger at
   all.
+- **Distance used for feasibility must be physical, not raw fret-count.**
+  Frets get narrower toward the body (~94% the width of the previous
+  fret each step, standard equal-tempered spacing) — a 2-fret stretch at
+  fret 3 is a real reach; a 2-fret stretch at fret 15 is nearly nothing.
+  Using raw `abs(fret_a - fret_b)` would treat both as equally hard,
+  which is wrong and would bias the optimizer away from upper-fret
+  passages that are actually easy. Needs a fret→physical-distance
+  conversion (lookup table or formula using that ~0.943 ratio) before
+  any stretch/feasibility math runs on fret numbers — the exact
+  table/formula is tomorrow's work, but every function touching fret
+  distance needs to be built assuming physical units, not fret-count
+  units, from the start.
 - Does NOT need to handle: barre chords, 3+ note dense voicings — those
   are explicitly out of scope (see PLAN.md exclusions). This only needs
   to cover single notes and simple 2-note dyads, which matches the
@@ -121,13 +133,21 @@ be reachable by one hand at once. So the graph's nodes have to be
   start)
 - Output: one cost number
 - Does: the real math — **not designed yet, next session's actual work**.
-  But the SHAPE is locked in now: cost must be discounted when
-  `rest_time` is large, since a big hand reposition during a long pause
-  is nearly free for a real player, while the same jump between two
-  rapid-fire notes is genuinely hard. Without `rest_time` as an input,
-  the optimizer would treat both identically — a structural bug, not a
-  tuning detail, which is why it's fixed in the signature today rather
-  than left for the cost-function session.
+  But two shape decisions are locked in now, not deferred:
+  1. Cost must be discounted when `rest_time` is large, since a big hand
+     reposition during a long pause is nearly free for a real player,
+     while the same jump between two rapid-fire notes is genuinely hard.
+  2. Anchor/fret distance must be measured in PHYSICAL units (accounting
+     for frets narrowing toward the body, ~0.943 ratio per fret), not
+     raw fret-count — same reasoning as the `candidate_assignments`
+     feasibility check above. A jump from fret 3→5 and a jump from fret
+     15→17 are the same fret-count distance but very different real
+     stretches; treating them as equal would bias the optimizer away
+     from upper-fret passages that are actually easy to play.
+  Without these two inputs, the optimizer would systematically misprice
+  both fast/slow transitions and low/high-fret transitions — structural
+  bugs, not tuning details, which is why they're fixed in the signature
+  today rather than left for the cost-function session.
 
 **`solve(self, moments: list[Moment]) -> list[list[HandPosition]]`**
 - Input: the full timed moment list
