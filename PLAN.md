@@ -1,8 +1,7 @@
 # Guitar Tab Visualizer — Project Plan
 
 ## Goal
-Portfolio project demonstrating applied math + software engineering for
-AI/ML internship applications. Takes a plain-text guitar tab, parses it,
+Takes a plain-text guitar tab, parses it,
 computes an efficient hand-fingering path (shortest-path / DP over hand
 positions), and renders an animated visualization of a hand playing it.
 
