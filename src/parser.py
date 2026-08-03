@@ -47,8 +47,6 @@ class Technique(Enum):
     BEND = "bend"
     VIBRATO = "vibrato"
 
-# ^ means "bend fully up to the next note" — this is a special case of bend that doesn't have a target fret number. 
-# It's not handled in the current parser, but could be added later if needed. For now, it will be ignored and treated as a normal note.
 
 # Characters that describe the TRANSITION into the next note on the same
 # string (i.e. they sit between two fret numbers and modify the second one).
@@ -200,6 +198,13 @@ def parse_line(content: str, string_index: int, string_name: str) -> list[Note]:
 
         elif c.lower() in ARRIVAL_CHARS:
             tokens.append((i, "arrival", ARRIVAL_CHARS[c.lower()]))
+            i += 1
+
+        elif c == "^":
+            # "^" = full bend (typically a whole-step bend with no
+            # explicit target fret given, unlike "b7" which names one).
+            # Same Technique.BEND as "b", just no digit-target to consume.
+            tokens.append((i, "modifier", (Technique.BEND, None)))
             i += 1
 
         elif c in MODIFIER_CHARS:
