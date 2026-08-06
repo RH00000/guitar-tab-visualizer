@@ -78,7 +78,7 @@ python -m src.optimizer
 
 ## Examples
 
-*(drop a screenshot or a short screen recording of the visualizer here once you've got one — this is the section people actually look at first)*
+![alt text](image-1.png)
 
 ## Tech stack
 
