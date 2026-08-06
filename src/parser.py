@@ -31,7 +31,7 @@ STANDARD_TUNING_ORDER = ["e", "B", "G", "D", "A", "E"]
 # Characters that can legitimately appear inside a tab line's content
 # (i.e. everything after the "e|" label). Used to detect whether a line
 # IS a tab line at all, vs. lyrics/section headers/chord names.
-ALLOWED_CONTENT_CHARS = set("-0123456789hHpPxXbB/\\~()")
+ALLOWED_CONTENT_CHARS = set("-0123456789hHpPxXbBsS/\\~()^|")
 
 # Real guitars go up to ~24 frets. Used to catch source-formatting slips
 # where two single-digit notes got typed with no separating dash.
@@ -44,8 +44,12 @@ class Technique(Enum):
     PULL_OFF = "pull_off"
     SLIDE_UP = "slide_up"
     SLIDE_DOWN = "slide_down"
+    SLIDE = "slide"            # "s" — direction unknown from the character alone; resolved once the target fret is known
     BEND = "bend"
     VIBRATO = "vibrato"
+    RELEASE = "release"       # "r" — bend released back down
+    PRE_BEND = "pre_bend"      # "pb" — string bent BEFORE being picked
+    REBEND = "rebend"          # "rb" — after a bend+release, bent again
 
 
 # Characters that describe the TRANSITION into the next note on the same
@@ -55,6 +59,7 @@ ARRIVAL_CHARS = {
     "p": Technique.PULL_OFF,
     "/": Technique.SLIDE_UP,
     "\\": Technique.SLIDE_DOWN,
+    "s": Technique.SLIDE,  # direction unknown yet — resolved in the assembly pass
 }
 
 # Characters that decorate a note that was ALREADY played, rather than
@@ -72,7 +77,8 @@ class Note:
     column: int                # absolute column across the WHOLE stitched song
     arrival: Technique = Technique.NONE    # how we got here from the prior note
     modifier: Technique = Technique.NONE   # decoration applied to this note itself
-    bend_target: int | None = None         # only set when modifier == BEND
+    technique_target: int | None = None      # target fret/pitch for BEND, RELEASE, or PRE_BEND — None if not specified
+    bend_amount: float | None = None         # step amount from "(1/2)"/"(2)" style notation — a DIFFERENT convention than technique_target, some tabs use one, some the other
 
     def __repr__(self):
         base = f"Note(str={self.string_name}, fret={self.fret}, col={self.column}"
@@ -80,8 +86,10 @@ class Note:
             base += f", arrival={self.arrival.name}"
         if self.modifier != Technique.NONE:
             base += f", modifier={self.modifier.name}"
-            if self.bend_target is not None:
-                base += f"->{self.bend_target}"
+            if self.technique_target is not None:
+                base += f"->{self.technique_target}"
+            if self.bend_amount is not None:
+                base += f"(+{self.bend_amount} steps)"
         return base + ")"
 
 
@@ -129,6 +137,48 @@ def group_into_blocks(lines: list[str]) -> list[list[str]]:
         blocks.append(current)
 
     return blocks
+
+
+def _consume_bend_qualifier(content: str, i: int, n: int) -> tuple[int | None, float | None, int]:
+    """
+    Shared by every bend-family technique ('b', 'pb', 'rb', 'r', '^').
+    Different tabs qualify a bend two DIFFERENT, incompatible ways, and
+    this project has now seen real files using both:
+      - target-fret notation: "5b7" = bend 5 up to sound like fret 7
+      - step-amount notation: "15b(2)" = bend 15 up by 2 whole steps
+    Without handling the second form explicitly, the tokenizer read
+    "(2)" as filler + a brand new note at fret 2 — not just lost
+    information, an ACTIVELY FABRICATED note that was never played.
+    Returns (target_or_None, amount_or_None, new_i) — at most one of
+    target/amount will be set, matching whichever notation was used.
+    """
+    if i < n and content[i].isdigit():
+        digits = ""
+        while i < n and content[i].isdigit():
+            digits += content[i]
+            i += 1
+        return int(digits), None, i
+
+    if i < n and content[i] == "(":
+        close = content.find(")", i)
+        if close == -1:
+            # Malformed — no closing paren found. Don't guess; just
+            # consume the "(" itself as filler and move on.
+            return None, None, i + 1
+        inner = content[i + 1:close]
+        i = close + 1
+        if "/" in inner:
+            num, _, denom = inner.partition("/")
+            try:
+                return None, float(num) / float(denom), i
+            except (ValueError, ZeroDivisionError):
+                return None, None, i
+        try:
+            return None, float(inner), i
+        except ValueError:
+            return None, None, i
+
+    return None, None, i
 
 
 def parse_line(content: str, string_index: int, string_name: str) -> list[Note]:
@@ -187,28 +237,57 @@ def parse_line(content: str, string_index: int, string_name: str) -> list[Note]:
         elif c in ("b", "B"):
             start = i
             i += 1
-            target = None
-            if i < n and content[i].isdigit():
-                digits = ""
-                while i < n and content[i].isdigit():
-                    digits += content[i]
-                    i += 1
-                target = int(digits)
-            tokens.append((start, "modifier", (Technique.BEND, target)))
+            target, amount, i = _consume_bend_qualifier(content, i, n)
+            tokens.append((start, "modifier", (Technique.BEND, target, amount)))
+
+        elif c in ("p", "P") and i + 1 < n and content[i + 1] in ("b", "B"):
+            # "pb" = pre-bend: the string is ALREADY bent before it's
+            # picked. This has to be checked before the generic ARRIVAL
+            # "p" (pull-off) case below, or "pb10" gets misread as
+            # "pull-off" + a dangling, unattached bend-to-10 that then
+            # silently gets dropped and the pull-off tag wrongly carries
+            # forward onto some later, unrelated note.
+            start = i
+            i += 2  # consume "pb" together
+            target, amount, i = _consume_bend_qualifier(content, i, n)
+            tokens.append((start, "modifier", (Technique.PRE_BEND, target, amount)))
 
         elif c.lower() in ARRIVAL_CHARS:
             tokens.append((i, "arrival", ARRIVAL_CHARS[c.lower()]))
             i += 1
 
+        elif c in ("r", "R") and i + 1 < n and content[i + 1] in ("b", "B"):
+            # "rb" = rebend: after an initial bend-and-release, bent a
+            # SECOND time. NOT the same technique as pre-bend ("pb") —
+            # pre-bend happens before the note is even picked, rebend is
+            # a second bend later in the same note's life — but parsed
+            # the same structural way, checked before bare "r" for the
+            # same reason "pb" is checked before bare "p".
+            start = i
+            i += 2
+            target, amount, i = _consume_bend_qualifier(content, i, n)
+            tokens.append((start, "modifier", (Technique.REBEND, target, amount)))
+
+        elif c in ("r", "R"):
+            # Bare "r" = release (bend let back down). Without this,
+            # "11r9" was being read as fret 11, THEN a totally separate
+            # new note at fret 9 — wrong; the "9" is the release's
+            # target pitch, not an independent note.
+            start = i
+            i += 1
+            target, amount, i = _consume_bend_qualifier(content, i, n)
+            tokens.append((start, "modifier", (Technique.RELEASE, target, amount)))
+
         elif c == "^":
             # "^" = full bend (typically a whole-step bend with no
             # explicit target fret given, unlike "b7" which names one).
             # Same Technique.BEND as "b", just no digit-target to consume.
-            tokens.append((i, "modifier", (Technique.BEND, None)))
-            i += 1
+            start = i
+            target, amount, i = _consume_bend_qualifier(content, i + 1, n)
+            tokens.append((start, "modifier", (Technique.BEND, target, amount)))
 
         elif c in MODIFIER_CHARS:
-            tokens.append((i, "modifier", (MODIFIER_CHARS[c], None)))
+            tokens.append((i, "modifier", (MODIFIER_CHARS[c], None, None)))
             i += 1
 
         else:
@@ -224,12 +303,20 @@ def parse_line(content: str, string_index: int, string_name: str) -> list[Note]:
         col, kind, val = tokens[idx]
 
         if kind == "fret":
+            arrival = pending_arrival
+            if arrival == Technique.SLIDE and notes:
+                # "s" doesn't say which direction — figure it out by
+                # comparing to the note we just came from on this SAME
+                # string (notes[-1], since parse_line handles one
+                # string at a time).
+                arrival = Technique.SLIDE_UP if val >= notes[-1].fret else Technique.SLIDE_DOWN
+
             note = Note(
                 string_index=string_index,
                 string_name=string_name,
                 fret=val,
                 column=col,
-                arrival=pending_arrival,
+                arrival=arrival,
             )
             pending_arrival = Technique.NONE
 
@@ -237,9 +324,10 @@ def parse_line(content: str, string_index: int, string_name: str) -> list[Note]:
             # (e.g. "7~" — vibrato on the note we just created), not a
             # future one. Attach it and consume it now.
             if idx + 1 < len(tokens) and tokens[idx + 1][1] == "modifier":
-                technique, target = tokens[idx + 1][2]
+                technique, target, amount = tokens[idx + 1][2]
                 note.modifier = technique
-                note.bend_target = target
+                note.technique_target = target
+                note.bend_amount = amount
                 idx += 1
 
             notes.append(note)
