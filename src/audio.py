@@ -19,6 +19,14 @@ frequency curve into phase. That's what makes a clean, click-free bend
 possible. It's a plainer, more "synth-guitar" timbre than a sampled
 string -- an honest, explainable tradeoff for glide-ability, not an
 attempt to sound identical to a real guitar recording.
+
+The same swept-frequency machinery gives slides a real glide too: a
+SLIDE_UP/SLIDE_DOWN (or unresolved bare SLIDE) note's frequency curve
+ramps from the DEPARTING note's pitch (see
+`src.moments.previous_note_by_string` -- the same lookup `visualizer.py`
+uses to animate the dot) to this note's own pitch over the first half
+of its hold, instead of jumping straight to the landed pitch the way a
+plain note does.
 """
 
 import math
@@ -26,7 +34,8 @@ import os
 
 import numpy as np
 
-from src.parser import Technique
+from src.moments import previous_note_by_string
+from src.parser import MAX_REALISTIC_FRET, Technique
 
 SAMPLE_RATE = 44100
 
@@ -43,6 +52,19 @@ OPEN_STRING_HZ = {
 
 BEND_TECHNIQUES = {Technique.BEND, Technique.REBEND, Technique.RELEASE}
 VIBRATO_TECHNIQUES = {Technique.VIBRATO}
+# Mirrors visualizer.py's SLIDE_TECHNIQUES -- bare Technique.SLIDE is
+# included because parser.py can only resolve its up/down direction by
+# comparing against a previous note on the same LINE, so a slide
+# opening a new block/line can still reach here unresolved; the actual
+# glide math below only needs a start fret, not a direction label, so
+# it doesn't care which of the three this is.
+SLIDE_TECHNIQUES = {Technique.SLIDE_UP, Technique.SLIDE_DOWN, Technique.SLIDE}
+
+# How many frets an unanchored slide (no previous note on this string
+# to read a real starting pitch from) runs before landing -- mirrors
+# visualizer.py's UNANCHORED_SLIDE_RUN_FRETS so the ear and the eye
+# agree even in this fallback case.
+UNANCHORED_SLIDE_RUN_FRETS = 8
 
 
 def fret_to_hz(string_index: int, fret: float) -> float:
@@ -66,10 +88,19 @@ def _bend_target_fret(note) -> float:
     return note.fret + 2
 
 
-def _frequency_curve(note, n_samples: int) -> np.ndarray:
+def _frequency_curve(note, n_samples: int, slide_start_fret: float | None = None) -> np.ndarray:
     """Per-sample instantaneous frequency (Hz) for one note's duration,
-    honoring bends/vibrato as an actual pitch sweep -- not just a
-    visual cue this time."""
+    honoring bends/vibrato/slides as an actual pitch sweep -- not just a
+    visual cue this time.
+
+    `slide_start_fret` (None unless this note arrived via a slide) is
+    handled as an ADDITIVE offset on top of whatever the modifier-based
+    curve below already computed, decaying to 0 over the first half of
+    the hold -- see `_note_offset_at`'s docstring in visualizer.py for
+    the matching dx animation. Additive, not an alternate branch, so a
+    slide INTO a bent/vibrato'd note (rare, but the tab format allows
+    it) still gets both effects instead of one silently overriding the
+    other."""
     progress = np.linspace(0.0, 1.0, n_samples, endpoint=False)
 
     if note.modifier == Technique.PRE_BEND:
@@ -87,14 +118,28 @@ def _frequency_curve(note, n_samples: int) -> np.ndarray:
     else:
         fret_curve = np.full(n_samples, float(note.fret if note.fret >= 0 else 0))
 
+    if slide_start_fret is not None:
+        # Ramp over the first half of the hold -- a real slide is a
+        # quick, continuous slap up/down the neck, not a slow squeeze
+        # like a bend -- then hold at 0 offset (i.e. the note's own
+        # landed pitch) for the rest.
+        ramp = np.clip(progress / 0.5, 0.0, 1.0)
+        fret_curve = fret_curve + (slide_start_fret - note.fret) * (1.0 - ramp)
+
     return fret_to_hz(note.string_index, fret_curve)
 
 
-def synth_note(note, duration: float, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+def synth_note(
+    note, duration: float, sample_rate: int = SAMPLE_RATE, slide_start_fret: float | None = None
+) -> np.ndarray:
     """Renders one note (any technique) to a mono float32 buffer,
     `duration` seconds long. Muted/dead notes (fret < 0) get a short
     burst of filtered noise (a pick "chuck") instead of a pitched
-    tone -- there's no pitch to synthesize for those."""
+    tone -- there's no pitch to synthesize for those.
+
+    `slide_start_fret`: see `_frequency_curve` -- pass this whenever
+    `note.arrival` is a slide technique; `render_track` resolves it via
+    `src.moments.previous_note_by_string` before calling this."""
     n_samples = max(1, int(duration * sample_rate))
     t = np.arange(n_samples) / sample_rate
     envelope = np.exp(-3.5 * t)  # plucked-string-ish decay, fast attack implied by starting at 1.0
@@ -117,7 +162,7 @@ def synth_note(note, duration: float, sample_rate: int = SAMPLE_RATE) -> np.ndar
         noise = np.random.default_rng(hash((note.string_index, note.column)) & 0xFFFF).standard_normal(n_samples)
         return (noise * envelope * 0.25).astype(np.float32)
 
-    freq_curve = _frequency_curve(note, n_samples)
+    freq_curve = _frequency_curve(note, n_samples, slide_start_fret)
     phase = 2 * math.pi * np.cumsum(freq_curve) / sample_rate
     wave = 0.60 * np.sin(phase) + 0.25 * np.sin(2 * phase) + 0.15 * np.sin(3 * phase)
     return (wave * envelope).astype(np.float32)
@@ -135,11 +180,30 @@ def render_track(moments, assignments, sample_rate: int = SAMPLE_RATE) -> np.nda
     total_samples = max(1, int(total_duration * sample_rate) + sample_rate)  # +1s tail for the last note's decay
     track = np.zeros(total_samples, dtype=np.float32)
 
+    # Same cross-moment "what note came before this one on this
+    # string" lookup visualizer.py uses to animate a slide's dot --
+    # here it supplies the pitch a slide glides FROM.
+    prev_note_map = previous_note_by_string(moments)
+
     for moment, assignment in zip(moments, assignments):
         start_sample = int(moment.start_time * sample_rate)
         for hp in assignment:
             note = hp.note
-            note_audio = synth_note(note, moment.duration, sample_rate)
+            slide_start_fret = None
+            if note.arrival in SLIDE_TECHNIQUES:
+                prev_note = prev_note_map.get(id(note))
+                if prev_note is not None and prev_note.fret >= 0:
+                    slide_start_fret = prev_note.fret
+                else:
+                    # No real previous note on this string -- run a
+                    # fixed distance in whatever direction is known (or
+                    # up, as a last resort), clamped to a realistic
+                    # fret range. Mirrors visualizer.py's fallback so
+                    # the ear and the eye still agree even here.
+                    direction = -1 if note.arrival == Technique.SLIDE_DOWN else 1
+                    fallback = note.fret - direction * UNANCHORED_SLIDE_RUN_FRETS
+                    slide_start_fret = max(0, min(MAX_REALISTIC_FRET, fallback))
+            note_audio = synth_note(note, moment.duration, sample_rate, slide_start_fret)
             end_sample = min(total_samples, start_sample + len(note_audio))
             track[start_sample:end_sample] += note_audio[: end_sample - start_sample]
 

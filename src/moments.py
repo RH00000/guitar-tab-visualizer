@@ -101,6 +101,40 @@ def group_into_moments(notes: list[Note], tolerance: int = 1) -> list[Moment]:
     return moments
 
 
+def previous_note_by_string(moments: list["Moment"]) -> dict[int, Note]:
+    """
+    Maps id(note) -> the note that came immediately before it on the
+    SAME STRING (by string_index), regardless of which Moment either
+    one landed in. A note with nothing before it on its string (the
+    first note ever played on that string in the whole song) is simply
+    absent from the returned dict.
+
+    This is what a hammer-on/pull-off/slide's "arrival" technique is
+    always describing a transition FROM — the note that was already
+    sounding on that string right before this one. It's computed here,
+    not in visualizer.py or audio.py, because it's a property of the
+    note SEQUENCE itself (true before any fingering is chosen and
+    before any rendering happens), so both consumers can look up what
+    they need — the visualizer wants the partner's assigned finger/
+    color, audio just wants its fret — from ONE shared mapping instead
+    of two separate reimplementations of "find the previous note on
+    this string."
+
+    Assumes `moments` is already in chronological (column) order, which
+    is how group_into_moments() returns it and how the rest of the
+    pipeline always passes it along.
+    """
+    last_by_string: dict[int, Note] = {}
+    result: dict[int, Note] = {}
+    for moment in moments:
+        for note in moment.notes:
+            prev = last_by_string.get(note.string_index)
+            if prev is not None:
+                result[id(note)] = prev
+            last_by_string[note.string_index] = note
+    return result
+
+
 if __name__ == "__main__":
     # Small hand-checkable sample: one single note, one genuine 2-note
     # chord (same column, different strings), and one same-string

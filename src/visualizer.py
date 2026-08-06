@@ -29,6 +29,41 @@ position, which is not what a bend looks like:
 This is a deliberately simple, honest stand-in for "the pitch is moving
 during this note" — not a physically simulated string.
 
+HAMMER-ONS / PULL-OFFS: both dots shown at once, not left to the user's
+imagination
+--------------------------------------------------------------------
+A hammer-on or pull-off is a transition FROM the previous note on the
+SAME STRING (see `moments.previous_note_by_string`) — physically, one
+finger is either landing on the string while another is already down
+(hammer-on) or lifting off while the string keeps ringing under a
+finger that was already there (pull-off). Rather than the visualizer
+guessing which is which (both look identical from the tab alone
+without deeper technique inference this project doesn't attempt), the
+departing note's dot is simply kept on screen, faded, for a short
+overlap window at the start of the arriving note — so BOTH dots are
+visible together for a moment, exactly like the two fingers really are.
+The direction the eye reads it in (a dot joining an existing one vs. a
+dot fading off an existing one) is what actually tells hammer-on from
+pull-off apart, same as it would watching a real hand.
+
+SLIDES: the dot glides across the frets it passes over, it doesn't
+teleport
+--------------------------------------------------------------------
+A slide's dot animates continuously (in physical x, same fret-position
+model as the rest of the board — see below) from the departing note's
+fret to the arriving note's fret over roughly the first half of its
+held duration, then stays put. The departing fret comes from the same
+`previous_note_by_string` lookup used for hammer-ons/pull-offs. When
+there IS no previous note on that string to slide from (a slide that
+opens a phrase, or the parser's un-inferrable bare "s" with no prior
+note on this string within the same line to compare against — see
+parser.py), there's no real starting fret to read off the tab at all;
+per this project's own convention (an honest, visible default rather
+than silently doing nothing), the slide is drawn as an 8-fret run in
+whatever direction the tab did specify (or up, as an arbitrary last
+resort if even direction is unknown), clamped to the drawn neck's own
+edges rather than sliding off it.
+
 FRET POSITIONS REUSE THE OPTIMIZER'S PHYSICAL MODEL
 ------------------------------------------------------
 `physical_fret_position` (equal-tempered, frets narrowing toward the
@@ -46,8 +81,9 @@ import time
 import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.animation import FuncAnimation
+from matplotlib.colors import to_rgba
 
-from src.moments import Moment
+from src.moments import Moment, previous_note_by_string
 from src.optimizer import HandPosition, physical_fret_position
 from src.parser import Technique
 
@@ -74,6 +110,26 @@ FINGER_LABELS = {
 
 BEND_TECHNIQUES = {Technique.BEND, Technique.REBEND, Technique.RELEASE}
 VIBRATO_TECHNIQUES = {Technique.VIBRATO}
+HAMMER_PULL_TECHNIQUES = {Technique.HAMMER_ON, Technique.PULL_OFF}
+# Technique.SLIDE (bare "s") is included here too -- parser.py can only
+# resolve its up/down direction by comparing against a previous note on
+# the SAME LINE, so a slide that opens a new block/line sometimes
+# reaches here still unresolved. previous_note_by_string() sees across
+# block boundaries, so it can resolve direction here even in that case
+# (see `_slide_start_fret_map` below); the `arrival`-based direction
+# guess is only a fallback for when there's truly no previous note at
+# all to compare against.
+SLIDE_TECHNIQUES = {Technique.SLIDE_UP, Technique.SLIDE_DOWN, Technique.SLIDE}
+
+# Fraction of the ARRIVING note's held duration that the departing
+# hammer-on/pull-off note's dot stays visible (faded) alongside it --
+# see the module docstring's "HAMMER-ONS / PULL-OFFS" section.
+HAMMER_PULL_OVERLAP_FRACTION = 0.35
+
+# How many frets an unanchored slide (no previous note on this string
+# to read a real starting fret from) runs before stopping -- see the
+# module docstring's "SLIDES" section.
+UNANCHORED_SLIDE_RUN_FRETS = 8
 
 
 class FretboardVisualizer:
@@ -263,30 +319,50 @@ class FretboardVisualizer:
         semitones = abs(self._bend_target_fret(note) - note.fret)
         return min(0.6, 0.12 * max(semitones, 1))
 
-    def _note_offset_at(self, note, t: float, moment: Moment) -> tuple[float, float]:
+    def _moment_progress(self, t: float, moment: Moment) -> float:
+        """How far into `moment`'s held duration `t` is, clamped to
+        [0, 1] -- shared by every time-based offset below (bend ramp,
+        vibrato, slide glide, hammer/pull overlap) so they all agree on
+        what "the start of this note" means."""
+        if moment.duration and moment.duration > 0:
+            return min(1.0, max(0.0, (t - moment.start_time) / moment.duration))
+        return 1.0
+
+    def _note_offset_at(
+        self, note, t: float, moment: Moment, slide_start_fret: float | None = None
+    ) -> tuple[float, float]:
         """
         (dx, dy) displacement from a note's plain (fret, string)
-        position at time `t`. A real string bend deflects the string
-        SIDEWAYS relative to its own length -- toward a neighboring
-        string, not up the neck to a different fret -- so this only
-        ever moves the dot vertically (dy); dx is always 0. Direction
-        is toward the neighboring string closer to the high e string
-        (the standard way a bend is physically pushed), except on the
-        high e string itself, which has no string above it to push
-        into and bends the other way, toward B.
-        """
-        if moment.duration and moment.duration > 0:
-            progress = min(1.0, max(0.0, (t - moment.start_time) / moment.duration))
-        else:
-            progress = 1.0
+        position at time `t`.
 
+        dy (bend/vibrato): a real string bend deflects the string
+        SIDEWAYS relative to its own length -- toward a neighboring
+        string, not up the neck to a different fret. Direction is
+        toward the neighboring string closer to the high e string (the
+        standard way a bend is physically pushed), except on the high e
+        string itself, which has no string above it to push into and
+        bends the other way, toward B.
+
+        dx (slide): a slide instead moves the dot ALONG the neck, from
+        `slide_start_fret` toward this note's own fret, over the first
+        half of the hold, then holds at 0 (i.e. sitting right on the
+        note's real fret) for the rest -- see the module docstring's
+        "SLIDES" section for where `slide_start_fret` comes from.
+        `slide_start_fret=None` means "not a slide" (dx stays 0), not
+        "unknown start" -- callers always resolve a slide's start fret
+        (real or the 8-fret fallback) before calling this.
+
+        Both can apply to the same note in principle (a slide into a
+        bent note) -- kept as independent dx/dy so that isn't lost.
+        """
+        progress = self._moment_progress(t, moment)
         direction = -1.0 if note.string_index == 0 else 1.0
 
+        dy = 0.0
         if note.modifier == Technique.PRE_BEND:
             # Already bent before being picked -- static for the whole note.
-            return 0.0, direction * self._bend_amplitude(note)
-
-        if note.modifier in BEND_TECHNIQUES:
+            dy = direction * self._bend_amplitude(note)
+        elif note.modifier in BEND_TECHNIQUES:
             amplitude = self._bend_amplitude(note)
             # Ramp over the first 40% of the hold, then stay deflected.
             ramp = min(1.0, progress / 0.4)
@@ -294,13 +370,20 @@ class FretboardVisualizer:
                 # A release is undoing an existing bend -- starts
                 # deflected, ramps back down to the string's rest line.
                 ramp = 1.0 - ramp
-            return 0.0, direction * amplitude * ramp
+            dy = direction * amplitude * ramp
+        elif note.modifier in VIBRATO_TECHNIQUES:
+            dy = 0.18 * math.sin(2 * math.pi * 6.0 * t)
 
-        if note.modifier in VIBRATO_TECHNIQUES:
-            wiggle = 0.18 * math.sin(2 * math.pi * 6.0 * t)
-            return 0.0, wiggle
+        dx = 0.0
+        if slide_start_fret is not None:
+            # Ramp over the first half of the hold (slides land sooner
+            # than a bend's ramp -- a real slide is a quick, continuous
+            # slap up/down the neck, not a slow squeeze), then sit still
+            # at the arrived fret for the remainder.
+            ramp = min(1.0, progress / 0.5)
+            dx = (self._fret_x(slide_start_fret) - self._fret_x(note.fret)) * (1.0 - ramp)
 
-        return 0.0, 0.0
+        return dx, dy
 
     def animate(
         self,
@@ -357,6 +440,37 @@ class FretboardVisualizer:
         """
         start_times = [m.start_time for m in moments]
 
+        # Cross-moment lookups, built once per song rather than per
+        # frame: which note preceded each note on its own string (for
+        # hammer-on/pull-off overlap and slide start frets), and which
+        # HandPosition (finger/color) the optimizer assigned to each
+        # note (so a departing hammer-on/pull-off dot can be drawn in
+        # ITS OWN finger's color, not the arriving note's).
+        prev_note_map = previous_note_by_string(moments)
+        hp_by_note_id: dict[int, HandPosition] = {}
+        for assignment in assignments:
+            for hp in assignment:
+                hp_by_note_id[id(hp.note)] = hp
+
+        slide_start_fret_map: dict[int, float] = {}
+        for assignment in assignments:
+            for hp in assignment:
+                note = hp.note
+                if note.arrival not in SLIDE_TECHNIQUES:
+                    continue
+                prev_note = prev_note_map.get(id(note))
+                if prev_note is not None and prev_note.fret >= 0:
+                    slide_start_fret_map[id(note)] = prev_note.fret
+                else:
+                    # No real previous note to read a starting fret
+                    # from -- run a fixed distance in whatever direction
+                    # is known (or up, as a last-resort guess -- see the
+                    # module docstring's "SLIDES" section), clamped to
+                    # the drawn neck so it never slides off the edge.
+                    direction = -1 if note.arrival == Technique.SLIDE_DOWN else 1
+                    fallback = note.fret - direction * UNANCHORED_SLIDE_RUN_FRETS
+                    slide_start_fret_map[id(note)] = max(0, min(self.num_frets, fallback))
+
         fretted_scatter = self.ax.scatter([], [], s=160, zorder=5, edgecolors="black", linewidths=0.8)
         muted_scatter = self.ax.scatter([], [], s=160, marker="x", zorder=5, c="#333333", linewidths=2)
         time_text = self.ax.text(
@@ -390,9 +504,25 @@ class FretboardVisualizer:
                     # dead/muted note ("x")
                     muted_xy.append((self._fret_x(0), base_y))
                     continue
-                dx, dy = self._note_offset_at(note, t, moment)
+                dx, dy = self._note_offset_at(note, t, moment, slide_start_fret_map.get(id(note)))
                 fretted_xy.append((self._fret_x(note.fret) + dx, base_y + dy))
                 fretted_colors.append(FINGER_COLORS.get(hp.finger, FINGER_COLORS[None]))
+
+                # Hammer-on/pull-off: briefly show the DEPARTING note's
+                # dot too, faded, right at the start of this note's
+                # hold -- see the module docstring's "HAMMER-ONS /
+                # PULL-OFFS" section for why this (not a guess at which
+                # technique it is) is what the visualizer actually draws.
+                if note.arrival in HAMMER_PULL_TECHNIQUES:
+                    progress = self._moment_progress(t, moment)
+                    if progress < HAMMER_PULL_OVERLAP_FRACTION:
+                        prev_note = prev_note_map.get(id(note))
+                        prev_hp = hp_by_note_id.get(id(prev_note)) if prev_note else None
+                        if prev_hp is not None and prev_note.fret >= 0:
+                            alpha = 1.0 - progress / HAMMER_PULL_OVERLAP_FRACTION
+                            fretted_xy.append((self._fret_x(prev_note.fret), base_y))
+                            base_color = FINGER_COLORS.get(prev_hp.finger, FINGER_COLORS[None])
+                            fretted_colors.append(to_rgba(base_color, alpha=alpha))
 
             fretted_scatter.set_offsets(np.array(fretted_xy) if fretted_xy else np.empty((0, 2)))
             if fretted_colors:
