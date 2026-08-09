@@ -50,6 +50,7 @@ Bends/vibrato bend the actual synthesized pitch, not just the dot.
 - Timing is approximate, not a real transcription. See the Rhythm section above.
 - No audio synthesis of in-progress bends yet: sample libraries exist for clean notes, but none of them record a bend's continuous pitch slide, so that piece still needs to be built rather than sourced.
 - Finger preference is currently a flat cost, which means it can still lose to a physically tiny hand-shift up near the highest frets. I found this while testing and I'm treating it as a known limitation rather than hiding it — a real fix means the finger-preference cost should scale with the local fret spacing instead of being constant, which I haven't built yet.
+- Slide/hammer-on/pull-off finger continuity only checks the note right before it in time, not the true previous note on that specific string. If another string's note falls in between (common in real solos), continuity can get missed. Fixing this properly means the optimizer's DP needs to carry per-string finger history forward as it solves, not just cost, which is a bigger structural change I'm leaving for later.
 
 ## Installation
 

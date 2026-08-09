@@ -37,6 +37,16 @@ ALLOWED_CONTENT_CHARS = set("-0123456789hHpPxXbBsS/\\~()^|")
 # where two single-digit notes got typed with no separating dash.
 MAX_REALISTIC_FRET = 24
 
+# How far to run an INDEFINITE slide ("10/" — a slide with a direction
+# but no destination fret) when synthesizing its missing destination
+# Note. Mirrors visualizer.py's/audio.py's UNANCHORED_SLIDE_RUN_FRETS,
+# which solves a related-but-different problem (an existing note with
+# nowhere to glide FROM, for rendering) — this constant is this file's
+# own, for the case of a note that doesn't exist yet at all. Kept as
+# the same value on purpose, for one consistent "how far is an
+# unspecified slide" answer across the whole pipeline.
+INDEFINITE_SLIDE_RUN_FRETS = 8
+
 
 class Technique(Enum):
     NONE = "none"
@@ -298,6 +308,7 @@ def parse_line(content: str, string_index: int, string_name: str) -> list[Note]:
     # Pass 2: assemble tokens into Notes.
     notes: list[Note] = []
     pending_arrival = Technique.NONE
+    pending_arrival_col = None  # column of the arrival CHARACTER itself, not the note it'll attach to
     idx = 0
     while idx < len(tokens):
         col, kind, val = tokens[idx]
@@ -334,11 +345,76 @@ def parse_line(content: str, string_index: int, string_name: str) -> list[Note]:
 
         elif kind == "arrival":
             pending_arrival = val
+            pending_arrival_col = col
 
         # kind == "modifier" with no preceding fret in this line is an
         # orphan token (malformed tab) — silently ignored.
 
         idx += 1
+
+    # An arrival token that's STILL pending after the loop ends means
+    # it was never followed by a fret token on this line — the
+    # "indefinite slide" case ("10/" with nothing after the "/",
+    # meaning "slide off, direction implied, exact ending fret
+    # unspecified"). Without this, the "/" set pending_arrival and then
+    # nothing ever consumed it: no destination Note was created at all,
+    # silently dropping a real, audible technique from the song.
+    if pending_arrival in (Technique.SLIDE_UP, Technique.SLIDE_DOWN) and notes:
+        origin = notes[-1]
+        direction = 1 if pending_arrival == Technique.SLIDE_UP else -1
+        raw_target = origin.fret + direction * INDEFINITE_SLIDE_RUN_FRETS
+        target_fret = max(0, min(MAX_REALISTIC_FRET, raw_target))
+
+        synthesized = Note(
+            string_index=string_index,
+            string_name=string_name,
+            # Column just after the arrival character itself, so it
+            # sorts immediately after the origin note but doesn't
+            # collide with any real token column on this line.
+            column=pending_arrival_col + 1,
+            fret=target_fret,
+            # This is the field src/optimizer.py's slide-continuity
+            # cost reads to require the SAME finger across the slide —
+            # setting it to anything else (or leaving it NONE) would
+            # make the optimizer silently never apply that rule here.
+            arrival=pending_arrival,
+        )
+        notes.append(synthesized)
+
+        direction_word = "up" if pending_arrival == Technique.SLIDE_UP else "down"
+        print(
+            f"WARNING: column {pending_arrival_col}: indefinite slide "
+            f"(fret {origin.fret} sliding {direction_word} with no target "
+            f"fret given) — inventing a destination {INDEFINITE_SLIDE_RUN_FRETS} "
+            f"frets {direction_word} at fret {target_fret}. This is an "
+            f"approximation of an intentionally unmeasured technique, not "
+            f"a real transcribed value — verify against the original tab."
+        )
+        if target_fret != raw_target:
+            print(
+                f"WARNING: column {pending_arrival_col}: indefinite slide's "
+                f"invented destination (fret {raw_target}) fell outside the "
+                f"realistic fretboard range (0-{MAX_REALISTIC_FRET}) — "
+                f"clamped to fret {target_fret} instead. The actual slide "
+                f"target is now different from a literal "
+                f"{INDEFINITE_SLIDE_RUN_FRETS}-fret run — verify against the "
+                f"original tab."
+            )
+    elif pending_arrival == Technique.SLIDE:
+        # Bare "s" with no target fret: not just missing a destination,
+        # missing the DIRECTION too, and there's no following fret to
+        # compare against (the usual way SLIDE gets resolved into
+        # SLIDE_UP/SLIDE_DOWN above). Fabricating a direction with no
+        # basis would be worse than not fabricating a note at all, so
+        # this is left out of the synthesis entirely — same as current
+        # behavior, just now explicitly flagged instead of silently
+        # dropped.
+        print(
+            f"WARNING: column {pending_arrival_col}: indefinite slide with "
+            f"unknown direction ('s' with no target fret to compare "
+            f"against) — cannot infer a direction, so no destination note "
+            f"was synthesized. Verify against the original tab."
+        )
 
     return notes
 

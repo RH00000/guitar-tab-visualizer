@@ -58,7 +58,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--bpm", type=float, default=None,
-        help="the song's real tempo, if you know it -- used to derive realistic playback timing (see rhythm.py). "
+        help="the song's real tempo, if you know it. Used to derive realistic playback timing (see rhythm.py). "
              "If omitted, falls back to a rougher default timing guess (no interactive prompt).",
     )
     parser.add_argument(

@@ -159,8 +159,47 @@ def synth_note(
     envelope = envelope * fade
 
     if note.fret is None or note.fret < 0:
+        # Muted/dead notes are a physically different sound from a
+        # pitched note -- a short percussive "chuck," not a sustained
+        # ring -- so they get their own envelope and their own
+        # filtering, not the pitched-note envelope reused above.
+        #
+        # A muted hit should be essentially silent by ~20-30ms in,
+        # independent of the tab's nominal duration for that slot
+        # (measured: the shared -3.5/s pitched-note envelope was still
+        # at 63% RMS at 120ms, which is why a dense muted passage --
+        # e.g. this project's own Master of Puppets gallop riff --
+        # bled each hit's leftover ring into the next one instead of
+        # sounding like distinct hits). -40.0/s decays to silence in
+        # roughly that window; the exact constant is tuned by ear for
+        # "clicky" vs. "thuddy," not derived from a measurement.
+        mute_envelope = np.exp(-40.0 * t) * fade
+
         noise = np.random.default_rng(hash((note.string_index, note.column)) & 0xFFFF).standard_normal(n_samples)
-        return (noise * envelope * 0.25).astype(np.float32)
+        # A real palm-muted hit ("chuck") is thump-dominated, not hiss --
+        # raw white noise is the opposite of that (energy spread evenly
+        # up into the harsh high end). This is a short moving-average
+        # smooth, i.e. a crude lowpass -- not a claim to physically
+        # model a palm mute, same "explainable tradeoff, not an attempt
+        # at physical realism" framing as the additive-synthesis method
+        # used for pitched notes above (see module docstring). No scipy
+        # dependency, so no proper FIR/IIR filter design here -- a boxcar
+        # convolution is the simplest thing that actually moves energy
+        # out of the high end.
+        kernel_size = min(n_samples, 24)
+        kernel = np.ones(kernel_size) / kernel_size
+        noise = np.convolve(noise, kernel, mode="same")
+
+        # The moving-average smooth cuts amplitude a lot harder than a
+        # single "roughly halves peak" glance suggests: averaging K
+        # uncorrelated white-noise samples shrinks their STANDARD
+        # DEVIATION (i.e. the RMS a listener actually perceives as
+        # loudness) by ~1/sqrt(K), not ~1/2 -- confirmed by measurement
+        # (attack-window RMS dropped to ~30% of the pre-fix level at
+        # the old `* 0.25`, not ~50%). Retuned upward from there so a
+        # muted hit's onset lands at roughly the SAME perceived
+        # loudness as before the filtering was added, not quieter.
+        return (noise * mute_envelope * 1.2).astype(np.float32)
 
     freq_curve = _frequency_curve(note, n_samples, slide_start_fret)
     phase = 2 * math.pi * np.cumsum(freq_curve) / sample_rate

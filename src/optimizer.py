@@ -112,9 +112,7 @@ from src.parser import Note, Technique
 
 # Bend-family techniques: all of these involve the fretting finger
 # actively pushing/holding the string under tension, which is the
-# physical motion that's awkward with the pinky. VIBRATO is a separate
-# oscillation technique but shares the same "pinky is rare here"
-# property in practice.
+# physical motion that's awkward with the pinky.
 #
 # Note: as of this writing, parser.py's parse_line only ever attaches
 # ONE modifier token to a Note (whichever immediately follows its fret
@@ -126,30 +124,54 @@ from src.parser import Note, Technique
 # bend-and-release pattern until that parser-level bug is fixed
 # separately. Not this file's bug to fix, but worth knowing why
 # RELEASE/REBEND may look like dead weight in testing until it is.
-BEND_VIBRATO_TECHNIQUES = (
-    Technique.BEND,
-    Technique.PRE_BEND,
-    Technique.REBEND,
-    Technique.RELEASE,
-    Technique.VIBRATO,
-)
+BEND_FAMILY = (Technique.BEND, Technique.PRE_BEND, Technique.REBEND, Technique.RELEASE)
 
-# Real per-finger preference for bending/vibrato specifically, in order
-# best -> worst: RING first (the standard bending finger -- strongest
-# controlled push, and the two fingers behind it on the neck can brace
-# it), then MIDDLE, then INDEX (weakest of the three without help
-# behind it), then PINKY last (weakest finger overall, awkward to hold
-# string tension with). This deliberately does NOT match the general
-# `_finger_cost` baseline's index-is-always-cheapest assumption -- that
-# baseline is about physical REACH from the anchor (index reaches
-# furthest for free because anchor is defined by it), which has nothing
-# to do with which finger has the STRENGTH/control to bend a string
-# well. A lone bent note with plenty of rest_time around it should
-# still prefer ring over index even though index "reaches for free,"
-# because bending isn't a reach problem, it's a strength problem.
-# Values are RANKS (0=best), turned into an actual cost by
-# `technique_weight` in `_finger_cost` -- not raw costs themselves.
-BEND_FINGER_RANK = {3: 0, 2: 1, 1: 2, 4: 3}  # ring, middle, index, pinky
+# Two separate magnitude-based cost tables, not one shared rank table.
+# A flat rank (0/1/2/3) forces equal spacing between every finger
+# step, which doesn't match real technique difficulty for either
+# technique, and the two techniques don't even share the same shape of
+# difficulty:
+#   - BEND_FINGER_COST: bending is a sustained strength/control
+#     problem (holding a string under tension in tune), and there's a
+#     real gradient to it -- ring is easiest (the two fingers behind it
+#     on the neck can brace it), then middle, then index (weakest of
+#     the three without help behind it), with pinky a much BIGGER jump
+#     than the even spacing between the others (weakest finger
+#     overall, genuinely awkward to hold string tension with, not just
+#     "one more rank down").
+#   - VIBRATO_FINGER_COST: vibrato is an oscillation, not a sustained
+#     push, so it's close to finger-agnostic for index/middle/ring --
+#     the only real penalty is pinky.
+# Both deliberately do NOT match the general `_finger_cost` baseline's
+# index-is-always-cheapest assumption -- that baseline is about
+# physical REACH from the anchor (index reaches furthest for free
+# because anchor is defined by it), which has nothing to do with which
+# finger has the STRENGTH/control to bend or oscillate a string well.
+# A lone bent note with plenty of rest_time around it should still
+# prefer ring over index even though index "reaches for free," because
+# bending isn't a reach problem, it's a strength problem.
+# These are starting values the project owner will tune by eye, not
+# measured constants.
+BEND_FINGER_COST = {3: 0.0, 2: 0.3, 1: 0.6, 4: 1.2}  # ring, middle, index, pinky
+VIBRATO_FINGER_COST = {3: 0.0, 2: 0.0, 1: 0.0, 4: 1.0}  # only pinky is penalized
+
+# Sliding lives on Note.arrival (how you got to this note), not
+# Note.modifier (how the note is decorated once you're on it) --
+# checking the wrong field would silently never match, same class of
+# bug as an earlier enum/string mismatch in this file. Bare
+# Technique.SLIDE is included alongside SLIDE_UP/SLIDE_DOWN because
+# parser.py's parse_line only resolves "s" into a direction when
+# there's a prior note on the same string to compare against -- the
+# first note on a string with a leading "s" has no prior note yet and
+# can reach here still unresolved. Like vibrato, sliding is close to
+# finger-agnostic except for a pinky penalty.
+SLIDE_TECHNIQUES = (Technique.SLIDE_UP, Technique.SLIDE_DOWN, Technique.SLIDE)
+SLIDE_FINGER_COST = {3: 0.0, 2: 0.0, 1: 0.0, 4: 1.0}
+
+# Hammer-ons/pull-offs, unlike slides, need a SECOND finger already (or
+# about to be) down on the same string -- see _legato_conflict_cost and
+# _pulloff_prepositioning_cost below.
+HAMMER_PULL_TECHNIQUES = (Technique.HAMMER_ON, Technique.PULL_OFF)
 
 FINGERS = (1, 2, 3, 4)  # 1=index, 2=middle, 3=ring, 4=pinky
 
@@ -234,14 +256,66 @@ class FingeringOptimizer:
                             player WOULD relocate given enough time) not
                             by raw fretboard position (a units-mismatch
                             artifact).
-      technique_weight   -- extra cost, per RANK step in BEND_FINGER_RANK,
-                            for bending/vibrato with a finger other than
-                            ring (module level: ring best, then middle,
-                            then index, then pinky worst -- see
-                            BEND_FINGER_RANK's own docstring for why this
-                            order does NOT just follow "whichever finger
-                            reaches for free," bending is a strength/
-                            control preference, not a reach one).
+      technique_weight   -- multiplier applied to the per-technique,
+                            per-finger MAGNITUDE cost tables
+                            (BEND_FINGER_COST, VIBRATO_FINGER_COST,
+                            SLIDE_FINGER_COST, module level) for
+                            bending, vibrato, and sliding respectively
+                            -- see those tables' own docstrings for why
+                            bending gets a real gradient (ring best,
+                            pinky a much bigger jump than the rest)
+                            while vibrato/slide are close to
+                            finger-agnostic except for pinky.
+      min_shift_discount -- floor on the rest_time discount applied to
+                            shift_cost (see `transition_cost`).
+                            rhythm.py's timing is a heuristic, not a
+                            real transcription, so a generous or
+                            overestimated rest_time can push the
+                            discount toward zero, making the model
+                            treat a hand relocation as nearly free even
+                            when the real available time was
+                            overestimated. The floor caps how much a
+                            bad rest_time estimate can distort the cost
+                            -- a defensive hedge against known-
+                            approximate timing data, not a claim that
+                            hand movement has some true minimum
+                            physical cost.
+      slide_continuity_weight -- cost when a slide (`Note.arrival` in
+                            SLIDE_TECHNIQUES) is assigned a DIFFERENT
+                            finger than whatever was already on that
+                            string a moment ago (see
+                            `_slide_continuity_cost`). A slide is one
+                            continuous motion of a single finger along
+                            the string -- you cannot switch fingers
+                            mid-slide, so this is close to a hard
+                            constraint rather than a soft preference,
+                            priced high enough that the DP will only
+                            ever pay it when every other option is
+                            worse (e.g. the origin note truly can't be
+                            reached at all, a data problem upstream).
+      legato_conflict_weight -- cost when a hammer-on/pull-off
+                            (`Note.arrival` in HAMMER_PULL_TECHNIQUES)
+                            is assigned the SAME finger as whatever was
+                            already on that string a moment ago (see
+                            `_legato_conflict_cost`) -- the opposite
+                            requirement from sliding: hammering onto or
+                            pulling off a fret needs a SECOND finger,
+                            since the first one is what's already
+                            sounding the origin note.
+      pulloff_prepositioning_weight -- cost, scaled by how far past one
+                            hand's reach the origin and destination
+                            frets are, for a PULL_OFF specifically (not
+                            HAMMER_ON) whose two frets aren't within a
+                            single hand's real physical stretch of each
+                            other (see `_pulloff_prepositioning_cost`).
+                            A pull-off needs the destination finger
+                            already resting on the string before the
+                            origin note releases -- both fingers
+                            coexist on the fretboard for an instant,
+                            like a phantom two-note chord, even though
+                            only one note sounds at a time. Hammer-on
+                            has no equivalent requirement, since the
+                            hammering finger can arrive fresh.
     """
 
     def __init__(
@@ -251,12 +325,20 @@ class FingeringOptimizer:
         max_stretch_frets: int = 4,
         finger_weight: float = 0.5,
         technique_weight: float = 0.08,
+        min_shift_discount: float = 0.35,
+        slide_continuity_weight: float = 1.5,
+        legato_conflict_weight: float = 1.5,
+        pulloff_prepositioning_weight: float = 3.0,
     ):
         self.stretch_weight = stretch_weight
         self.shift_weight = shift_weight
         self.max_stretch_frets = max_stretch_frets
         self.finger_weight = finger_weight
         self.technique_weight = technique_weight
+        self.min_shift_discount = min_shift_discount
+        self.slide_continuity_weight = slide_continuity_weight
+        self.legato_conflict_weight = legato_conflict_weight
+        self.pulloff_prepositioning_weight = pulloff_prepositioning_weight
 
     def _note_candidates(self, note: Note) -> list[HandPosition]:
         """
@@ -466,33 +548,160 @@ class FingeringOptimizer:
             fret -- see `finger_weight`'s docstring in `__init__` for
             why this replaced an earlier flat per-finger-step version
             that was a real bug, not just a rougher approximation).
-          - technique: an EXTRA charge for bend-family/vibrato notes
-            (see BEND_VIBRATO_TECHNIQUES at module level for the exact
-            set, and the note there about a parser.py limitation that
-            currently affects how often RELEASE/REBEND actually fire),
-            scaled by `technique_weight` times that finger's RANK in
-            BEND_FINGER_RANK -- ring costs nothing extra, middle a
-            little, index more, pinky most. This is a real preference
-            order, not just "avoid the pinky": bending is a STRENGTH/
-            control problem (which finger can push a string in tune,
-            braced by the fingers behind it), not the reach problem the
-            baseline above prices, so it can rank index (which the
-            baseline treats as free) as WORSE than ring for a bend even
-            though index reaches its own fret at zero physical cost.
-            Priced on top of, not instead of, the baseline. Left as a
-            flat constant on purpose, same as before: unlike the
-            baseline, this isn't standing in for a physical reach, it's
-            a technique-difficulty preference (a ring-finger bend isn't
+          - technique: an EXTRA charge, scaled by `technique_weight`,
+            for bend-family/vibrato/slide notes, using per-technique
+            magnitude-based cost tables (BEND_FINGER_COST,
+            VIBRATO_FINGER_COST, SLIDE_FINGER_COST at module level --
+            see their docstrings there for why bending gets a real
+            gradient while vibrato/slide are close to finger-agnostic
+            except for pinky). This is a real preference order, not
+            just "avoid the pinky": bending is a STRENGTH/control
+            problem (which finger can push a string in tune, braced by
+            the fingers behind it), not the reach problem the baseline
+            above prices, so it can cost index (which the baseline
+            treats as free) MORE than ring for a bend even though index
+            reaches its own fret at zero physical cost. Priced on top
+            of, not instead of, the baseline. Left as flat constants on
+            purpose, same as before: unlike the baseline, these aren't
+            standing in for a physical reach, they're technique-
+            difficulty preferences (a ring-finger bend isn't
             meaningfully easier at fret 5 than at fret 15), so there's
-            no physical-distance law it should be shrinking to match.
+            no physical-distance law they should be shrinking to match.
+            The bend check and the vibrato check are mutually exclusive
+            (`elif`) since both live on the same `Note.modifier` field
+            and a note can only carry one modifier. The slide check is
+            a separate, independent `if`: sliding lives on
+            `Note.arrival` (how you got to this note), not `modifier`
+            (how it's decorated once you're on it) -- a note's arrival
+            and modifier are independent fields and can both apply to
+            the same note (e.g. slide into a bend), so it isn't an
+            `elif` off the other two.
         """
         cost = 0.0
         for hp in to_assignment:
             if hp.finger is None or hp.anchor_fret is None:
                 continue
             cost += self.finger_weight * physical_distance(hp.anchor_fret, hp.note.fret)
-            if hp.note.modifier in BEND_VIBRATO_TECHNIQUES:
-                cost += self.technique_weight * BEND_FINGER_RANK[hp.finger]
+            if hp.note.modifier in BEND_FAMILY:
+                cost += self.technique_weight * BEND_FINGER_COST[hp.finger]
+            elif hp.note.modifier == Technique.VIBRATO:
+                cost += self.technique_weight * VIBRATO_FINGER_COST[hp.finger]
+            if hp.note.arrival in SLIDE_TECHNIQUES:
+                cost += self.technique_weight * SLIDE_FINGER_COST[hp.finger]
+        return cost
+
+    def _slide_continuity_cost(
+        self,
+        from_assignment: list[HandPosition],
+        to_assignment: list[HandPosition],
+    ) -> float:
+        """
+        A slide is one continuous motion of a single finger sliding
+        along the string, not a reposition -- you cannot switch which
+        finger is pressing down partway through. If `to_assignment`
+        puts a DIFFERENT finger on a slide note than whichever finger
+        was on that same string a moment ago, that's not a real slide
+        at all, so it's charged `slide_continuity_weight`. This is
+        distinct from `_finger_cost`'s SLIDE_FINGER_COST, which prices
+        WHICH finger is doing the sliding (pinky worse); this prices
+        whether the finger is even the SAME one as before, which
+        `_finger_cost` has no way to know (it only ever looks at
+        `to_assignment` in isolation, never the previous moment).
+
+        Priced high, same as `_legato_conflict_cost` below: this is
+        close to a hard physical constraint, not a soft comfort
+        preference, so it should only ever lose to an option that's
+        even worse (e.g. the origin note genuinely isn't reachable by
+        any single finger available, a data problem upstream, not
+        something this cost is meant to paper over).
+        """
+        if not from_assignment:
+            return 0.0
+        from_finger_by_string = {
+            hp.note.string_name: hp.finger for hp in from_assignment if hp.finger is not None
+        }
+        cost = 0.0
+        for hp in to_assignment:
+            if hp.finger is None or hp.note.arrival not in SLIDE_TECHNIQUES:
+                continue
+            prior_finger = from_finger_by_string.get(hp.note.string_name)
+            if prior_finger is not None and prior_finger != hp.finger:
+                cost += self.slide_continuity_weight
+        return cost
+
+    def _legato_conflict_cost(
+        self,
+        from_assignment: list[HandPosition],
+        to_assignment: list[HandPosition],
+    ) -> float:
+        """
+        The opposite requirement from sliding: a hammer-on or pull-off
+        needs a SECOND finger, distinct from whatever finger is already
+        down on that string, because that first finger is what's
+        sounding (or was just sounding) the origin note. If
+        `to_assignment` reuses the SAME finger that was on that string
+        a moment ago for a hammer-on/pull-off note, that's not
+        physically playable as a legato move, so it's charged
+        `legato_conflict_weight`.
+        """
+        if not from_assignment:
+            return 0.0
+        from_finger_by_string = {
+            hp.note.string_name: hp.finger for hp in from_assignment if hp.finger is not None
+        }
+        cost = 0.0
+        for hp in to_assignment:
+            if hp.finger is None or hp.note.arrival not in HAMMER_PULL_TECHNIQUES:
+                continue
+            prior_finger = from_finger_by_string.get(hp.note.string_name)
+            if prior_finger is not None and prior_finger == hp.finger:
+                cost += self.legato_conflict_weight
+        return cost
+
+    def _pulloff_prepositioning_cost(
+        self,
+        from_assignment: list[HandPosition],
+        to_assignment: list[HandPosition],
+    ) -> float:
+        """
+        A stricter, SEPARATE check that applies only to PULL_OFF, not
+        HAMMER_ON. A pull-off requires the destination finger to
+        already be resting on the string BEFORE the origin note
+        releases -- both fingers coexist on the fretboard for an
+        instant, like a phantom two-note chord, even though only one
+        note sounds at a time. That means the origin and destination
+        frets must be within one hand's real physical reach of each
+        other -- the same stretch-feasibility test
+        `candidate_assignments` already runs for a genuine simultaneous
+        dyad, just applied here across a moment boundary instead of
+        within one moment. Hammer-on has no equivalent requirement:
+        the hammering finger can arrive fresh, it doesn't need to
+        already be in position.
+
+        Scaled by how far PAST one hand's reach the two frets are, not
+        a flat penalty -- a marginal overreach costs less than a
+        genuinely impossible one (e.g. a written "pull-off" spanning
+        12 frets, which likely indicates a moments.py grouping issue
+        or a parser misread rather than a real playable pull-off, and
+        should be priced as unmistakably bad, not just mildly
+        discouraged).
+        """
+        if not from_assignment:
+            return 0.0
+        max_physical_stretch = physical_distance(0, self.max_stretch_frets - 1)
+        from_by_string = {
+            hp.note.string_name: hp for hp in from_assignment if hp.anchor_fret is not None
+        }
+        cost = 0.0
+        for hp in to_assignment:
+            if hp.anchor_fret is None or hp.note.arrival != Technique.PULL_OFF:
+                continue
+            prior_hp = from_by_string.get(hp.note.string_name)
+            if prior_hp is None:
+                continue
+            span = physical_distance(prior_hp.anchor_fret, hp.anchor_fret)
+            overage = max(0.0, span - max_physical_stretch)
+            cost += self.pulloff_prepositioning_weight * overage
         return cost
 
     def transition_cost(
@@ -510,7 +719,19 @@ class FingeringOptimizer:
         `from_assignment == []` means "cold start" (no prior hand
         position, e.g. the very first moment of the song) -- shift cost
         is skipped entirely in that case, only the new shape's own
-        stretch and finger cost apply.
+        stretch and finger cost apply. The same is true of
+        `_slide_continuity_cost`, `_legato_conflict_cost`, and
+        `_pulloff_prepositioning_cost` below -- all three compare
+        `to_assignment` against the PREVIOUS moment's finger-per-string
+        layout, so all three are no-ops on a cold start, same as shift
+        cost, for the same reason (nothing to compare against yet).
+
+        These three costs are about which finger is PHYSICALLY
+        POSSIBLE given what finger was on the same string a moment
+        ago -- distinct from `_finger_cost`'s per-note preferences
+        (finger_weight/technique_weight), which only ever look at
+        `to_assignment` in isolation and have no way to see the
+        previous moment at all.
         """
         to_anchors = [hp.anchor_fret for hp in to_assignment if hp.anchor_fret is not None]
 
@@ -538,11 +759,24 @@ class FingeringOptimizer:
             shift_distance = physical_distance(from_pos, to_pos)
             # Hyperbolic discount: more rest time -> cheaper repositioning,
             # never negative, never fully free (a truly instant jump
-            # between rapid-fire notes stays at full cost).
-            discount = 1.0 / (1.0 + max(rest_time, 0.0))
+            # between rapid-fire notes stays at full cost). Floored at
+            # `min_shift_discount`: rhythm.py's rest_time is a heuristic,
+            # not a real transcription, so an overestimated rest_time
+            # could otherwise push the discount toward zero and make a
+            # hand relocation look nearly free purely because the timing
+            # guess was generous. The floor is a hedge against bad
+            # timing data, not a claim about real minimum movement cost.
+            discount = max(self.min_shift_discount, 1.0 / (1.0 + max(rest_time, 0.0)))
             shift_cost = self.shift_weight * shift_distance * discount
 
-        return stretch_cost + shift_cost + finger_cost
+        return (
+            stretch_cost
+            + shift_cost
+            + finger_cost
+            + self._slide_continuity_cost(from_assignment, to_assignment)
+            + self._legato_conflict_cost(from_assignment, to_assignment)
+            + self._pulloff_prepositioning_cost(from_assignment, to_assignment)
+        )
 
     def solve(self, moments: list[Moment]) -> list[list[HandPosition]]:
         """
