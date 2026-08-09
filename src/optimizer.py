@@ -321,11 +321,11 @@ class FingeringOptimizer:
     def __init__(
         self,
         stretch_weight: float = 1.0,
-        shift_weight: float = 1.0,
-        max_stretch_frets: int = 4,
+        shift_weight: float = 2.5,  # too much awkward repositioning thats why i increased it from 1.0 to 2.5
+        max_stretch_frets: int = 5,
         finger_weight: float = 0.5,
         technique_weight: float = 0.08,
-        min_shift_discount: float = 0.35,
+        min_shift_discount: float = 0.5,
         slide_continuity_weight: float = 1.5,
         legato_conflict_weight: float = 1.5,
         pulloff_prepositioning_weight: float = 3.0,

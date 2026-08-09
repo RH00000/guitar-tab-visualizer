@@ -73,9 +73,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--tolerance", type=int, default=1,
         help="column tolerance for grouping notes into a shared moment/chord (default 1 -- see moments.py)",
     )
-    parser.add_argument("--stretch-weight", type=float, default=1.0, help="optimizer: cost per unit of within-chord finger spread")
-    parser.add_argument("--shift-weight", type=float, default=1.0, help="optimizer: cost per unit of hand travel between moments")
-    parser.add_argument("--max-stretch-frets", type=int, default=4, help="optimizer: max comfortable one-hand fret span")
+    # default=None, not a hardcoded number: FingeringOptimizer's own
+    # constructor defaults (src/optimizer.py) are the single source of
+    # truth for "what does the model believe by default" -- that's
+    # where these get tuned by ear. A second hardcoded default here
+    # would silently shadow every tuning change made there unless this
+    # file was ALSO updated to match, which is exactly what happened
+    # (shift_weight was bumped to 2.5 in optimizer.py, but this flag's
+    # default stayed at 1.0 and kept winning on every run that didn't
+    # pass --shift-weight explicitly). None means "the user didn't ask
+    # for an override" -- see the FingeringOptimizer(...) call below,
+    # which only passes a keyword through when the flag was actually
+    # set, letting FingeringOptimizer's own default apply otherwise.
+    parser.add_argument("--stretch-weight", type=float, default=None, help="optimizer: cost per unit of within-chord finger spread (default: FingeringOptimizer's own)")
+    parser.add_argument("--shift-weight", type=float, default=None, help="optimizer: cost per unit of hand travel between moments (default: FingeringOptimizer's own)")
+    parser.add_argument("--max-stretch-frets", type=int, default=None, help="optimizer: max comfortable one-hand fret span (default: FingeringOptimizer's own)")
     parser.add_argument("--num-frets", type=int, default=15, help="how many frets to draw on the fretboard (auto-extends if the song needs more)")
     parser.add_argument("--fps", type=int, default=20, help="playback frame rate")
     parser.add_argument(
@@ -134,11 +146,17 @@ def main(argv: list[str] | None = None) -> None:
     else:
         moments = assign_timing(moments, seconds_per_column=args.seconds_per_column)
 
-    optimizer = FingeringOptimizer(
-        stretch_weight=args.stretch_weight,
-        shift_weight=args.shift_weight,
-        max_stretch_frets=args.max_stretch_frets,
-    )
+    # Only pass through the args the user actually typed on the command
+    # line -- an unset (None) flag means "no override," so
+    # FingeringOptimizer's own constructor default applies untouched,
+    # instead of this file silently reintroducing a second, competing
+    # default that can drift out of sync with the real one.
+    overrides = {
+        "stretch_weight": args.stretch_weight,
+        "shift_weight": args.shift_weight,
+        "max_stretch_frets": args.max_stretch_frets,
+    }
+    optimizer = FingeringOptimizer(**{k: v for k, v in overrides.items() if v is not None})
     solution = optimizer.solve(moments)
 
     viz = FretboardVisualizer(num_frets=args.num_frets)
