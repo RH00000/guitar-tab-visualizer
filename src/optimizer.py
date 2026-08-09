@@ -322,10 +322,10 @@ class FingeringOptimizer:
         self,
         stretch_weight: float = 1.0,
         shift_weight: float = 2.5,  # too much awkward repositioning thats why i increased it from 1.0 to 2.5
-        max_stretch_frets: int = 5,
+        max_stretch_frets: float = 4.5,
         finger_weight: float = 0.5,
         technique_weight: float = 0.08,
-        min_shift_discount: float = 0.5,
+        min_shift_discount: float = 0.35,
         slide_continuity_weight: float = 1.5,
         legato_conflict_weight: float = 1.5,
         pulloff_prepositioning_weight: float = 3.0,
@@ -350,28 +350,76 @@ class FingeringOptimizer:
         simplification: a muted hit is usually played by whichever
         finger is already resting nearby, so it isn't modeled as
         claiming a dedicated finger slot here.
+
+        FIXED BUG, not a tunable change: middle/ring/pinky each used to
+        get exactly ONE candidate anchor, at a fixed RAW offset from
+        the note's fret (index=0, middle=1, ring=2, pinky=3 frets back
+        — `anchor = note.fret - (finger - 1)`). That's wrong the same
+        way a flat-per-finger-step cost was wrong elsewhere in this
+        file (see the module docstring's "FINGER cost was originally a
+        flat per-finger-step constant" section): frets narrow toward
+        the body, so the SAME physical stretch a real hand can make
+        covers MORE raw frets up the neck than it does near the nut.
+        Confirmed empirically: a fret15+fret18 dyad (a 3-raw-fret gap,
+        physically trivial that high up) had ZERO feasible index+ring
+        combination at zero stretch cost under the old fixed offset —
+        only index+pinky could reach it, forcing the wrong finger into
+        a role a real player's ring finger handles easily up there.
+
+        The fix gives middle/ring/pinky a RANGE of valid anchors, not
+        one: starting at each finger's traditional raw offset (kept as
+        the floor — a real hand doesn't use ring to play a note index
+        could reach just as easily) and extending outward exactly as
+        far as that finger's PHYSICAL reach limit allows, using the
+        same principle `max_stretch_frets` already uses elsewhere in
+        this file — calibrated against the worst case, the nut
+        (`physical_distance(0, finger - 1)`), where raw-fret and
+        physical distance are closest together and the traditional
+        offset is most nearly correct. At low frets this reach limit
+        is barely wider than the traditional offset itself, so it
+        produces the exact SAME single candidate as before — verified,
+        not a behavior change there. Candidate counts legitimately grow
+        at high frets (more real options genuinely exist), which is
+        expected and still entirely tractable at solo-tab length.
+
+        Index (finger 1) is excluded from this range logic on purpose:
+        `anchor_fret` is DEFINED as wherever the index finger sits
+        (see the module docstring's "THE PHYSICAL MODEL" section) —
+        index always plays its own fret directly, that's not a
+        convention that should flex.
         """
         if note.fret <= 0:
             return [HandPosition(note=note, finger=None, anchor_fret=None)]
 
-        options = []
-        for finger in FINGERS:
-            anchor = note.fret - (finger - 1)
-            if anchor < 0:
-                continue  # this finger can't reach this fret from any real hand position
-            # anchor == 0 is a real, valid hand position (right at the
-            # nut) -- e.g. fret 1 played with the middle finger, index
-            # resting near fret 0. It's distinct from an open string
-            # (fret 0 itself, handled entirely above and never reaches
-            # here): this is a FRETTED note, just played from the
-            # lowest possible position. Excluding it was the original
-            # bug -- two notes at the same low fret (a real pattern:
-            # Master of Puppets' gallop riff repeats fret 1 on two
-            # adjacent strings) would otherwise both be forced onto
-            # finger 1 with no alternative, making them un-fingerable
-            # as a pair even though a real player just uses two
-            # different fingers close to the nut.
-            options.append(HandPosition(note=note, finger=finger, anchor_fret=anchor))
+        options = [HandPosition(note=note, finger=1, anchor_fret=note.fret)]
+        for finger in FINGERS[1:]:
+            # Calibrated the same way max_stretch_frets is calibrated
+            # elsewhere in this file: the physical distance this
+            # finger's traditional raw offset corresponds to at the
+            # worst-case position, the nut — never a raw fret-count.
+            max_reach = physical_distance(0, finger - 1)
+            offset = finger - 1  # traditional minimum, always kept as the floor
+            while True:
+                anchor = note.fret - offset
+                if anchor < 0:
+                    break  # can't reach this fret from any real hand position
+                # anchor == 0 is a real, valid hand position (right at
+                # the nut) -- e.g. fret 1 played with the middle
+                # finger, index resting near fret 0. It's distinct from
+                # an open string (fret 0 itself, handled entirely
+                # above and never reaches here): this is a FRETTED
+                # note, just played from the lowest possible position.
+                # Excluding it was an earlier bug -- two notes at the
+                # same low fret (a real pattern: Master of Puppets'
+                # gallop riff repeats fret 1 on two adjacent strings)
+                # would otherwise both be forced onto finger 1 with no
+                # alternative, making them un-fingerable as a pair even
+                # though a real player just uses two different fingers
+                # close to the nut.
+                if physical_distance(anchor, note.fret) > max_reach:
+                    break  # past this finger's real physical reach limit at this position
+                options.append(HandPosition(note=note, finger=finger, anchor_fret=anchor))
+                offset += 1
         return options
 
     def candidate_assignments(self, moment: Moment) -> list[list[HandPosition]]:
