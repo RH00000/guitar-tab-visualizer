@@ -2,105 +2,50 @@
 optimizer.py
 
 Chooses one hand-fingering assignment per Moment for the whole song,
-minimizing total physical effort. This is the resume-worthy piece: a
-dynamic program over HAND SHAPES, not over individual notes.
+minimizing total physical effort.
 
-THE PHYSICAL MODEL
---------------------
-A guitarist's fretting hand sits at some ANCHOR FRET at any instant —
-roughly, where the index finger rests. From that anchor, each finger
-naturally covers one fret: index=anchor, middle=anchor+1, ring=
-anchor+2, pinky=anchor+3. So playing a note at fret F with finger f
-implies anchor = F - (f-1); that's exactly `HandPosition.anchor_fret`.
-
-A single note has up to 4 candidate fingerings (which finger plays it).
-A moment with multiple simultaneous notes (a dyad) is a JOINT decision:
-the fingers used must all be different, AND they must be reachable
-from close to the SAME anchor at once — you only have one hand. That's
-why the DP's nodes are whole-moment assignments, not per-note choices
-(see METHODS_AND_INTERFACES.md — this is the actual fix over a naive
-"decide each note independently" approach, which can't represent "you
-can't use your ring finger twice at once").
-
-THREE COSTS, ALL IN PHYSICAL OR PHYSICAL-ADJACENT UNITS
-----------------------------------------------------------
-- STRETCH cost: how spread apart a moment's OWN anchors are (a chord's
-  internal difficulty), priced by `stretch_weight`.
-- SHIFT cost: how far the hand's anchor has to travel from the
-  PREVIOUS moment's shape to this one, priced by `shift_weight` and
-  discounted when there's more time available to make the move.
-- FINGER cost: which finger got used, independent of stretch/shift.
-  Found necessary empirically, not designed in from the start — see
-  the note in `__init__` and `_finger_cost` below. Without it, finger
-  choice is a free variable: because `anchor = fret - (finger - 1)`,
-  the DP can redefine a note's anchor just by picking a different
-  finger for it, and it will do so purely to make `shift_cost` cheaper
-  (e.g. reaching a note with the pinky instead of the index, just to
-  keep the anchor parked near a neighboring moment) — a "free" trick
-  that has nothing to do with how comfortable that finger choice
-  actually is. `finger_weight` prices the finger itself, and
-  `technique_weight` adds an extra charge for using the pinky
-  specifically on a bend or vibrato, where it's rare and awkward in
-  real playing (ring finger should be doing that work instead).
-
-STRETCH, SHIFT, and FINGER's baseline ALL use PHYSICAL fret distance,
-not raw fret-count: frets narrow toward the body under standard
-equal-tempered spacing (each fret is 2**(-1/12) ≈ 0.9439 the WIDTH of
-the fret before it — the guitar's 12th fret sits at exactly half the
-scale length). A 2-fret jump at fret 3 is a real reach; the same
-2-fret jump at fret 15 is nearly nothing. Treating both as "2" would
-bias the optimizer away from upper-fret passages that are actually
-easy — so every distance calculation here goes through
-`physical_fret_position` first, never raw fret subtraction.
-
-FINGER cost was originally a flat per-finger-step constant instead
-(pinky = 3x the cost of middle, everywhere on the neck, regardless of
-position) — that turned out to be a real bug, not just a rougher
-approximation: a flat cost never shrinks, but SHIFT's physical
-distance does shrink toward zero up the neck by construction. That
-mismatch meant there was always some fret position above which
-relocating the whole hand got priced as cheaper than just switching
-fingers while staying put — not because that's realistic, but purely
-because the two costs lived on different scales. Pricing FINGER's
-baseline as a physical reach too (see `_finger_cost`) fixes this
-structurally: all three costs now shrink together at the same rate up
-the neck, so trading a finger switch for a hand relocation is decided
-by genuinely available `rest_time` (correct), not by raw fretboard
-position (a units-mismatch artifact). The one deliberate exception is
-`technique_weight` (the extra pinky-on-bend/vibrato charge): that's a
-flat constant on purpose, because it prices a technique-difficulty
-preference, not a spatial one — awkwardness of pinky string-bending
-doesn't get easier just because you're higher up the neck.
-
-A CORRECTED INTERPRETATION OF "REST TIME" (found while building this,
-not assumed away)
-------------------------------------------------------------------------
-METHODS_AND_INTERFACES.md describes transition_cost's rest_time as
-"previous moment's end -> next moment's start." Taken literally, that
-is ALWAYS ZERO under this project's rhythm.py: duration is defined as
-"hold until the next moment's onset," so a moment's end and the next
-moment's start are the same instant by construction — there is no
-literal silence to measure. The actual intent is "how much time is
-available to move the hand before the next note must sound," which IS
-a real, nonzero, useful quantity: the INTER-ONSET interval, i.e. the
-previous moment's `duration` (= next.start_time - this.start_time).
-That's what `solve()` actually passes as rest_time. Using the literal
-"end to start" definition would make the entire discount feature a
-dead code path that never discounts anything — worth catching before
-building it, not after.
-
-THE DP ITSELF
+PHYSICAL MODEL
 --------------
-- Layer i = moment i (not note i — a chord gets ONE joint decision).
-- Node = one full joint assignment for that moment (one HandPosition
-  per note), from `candidate_assignments`.
-- Edge (i-1 -> i) cost = `transition_cost`, using the inter-onset
-  interval between the two moments as rest_time.
-- `solve` does the standard forward pass (accumulate the cheapest way
-  to reach each node, remembering which predecessor achieved it) then
-  a backward trace from the cheapest final node — the same shape as
-  textbook edit-distance / Viterbi DP, just with "hand shape" as the
-  state instead of "row/column" or "hidden state."
+The hand sits at an ANCHOR FRET; each finger naturally covers one
+fret from there (index=anchor, middle=+1, ring=+2, pinky=+3), so
+anchor = fret - (finger - 1). A dyad is a JOINT decision -- fingers
+must differ (barre exception: same finger, same fret) and be
+reachable from one anchor at once. That's why the DP's nodes are
+whole-moment assignments, not per-note choices.
+
+THREE COSTS -- all in PHYSICAL fret distance, not raw fret-count
+(frets narrow toward the body, so a 2-fret jump at fret 3 is a real
+reach; the same jump at fret 15 is nearly free -- everything goes
+through `physical_fret_position`, never raw subtraction):
+- STRETCH: spread within one moment's own shape (stretch_weight).
+- SHIFT: how far the anchor moves between moments, discounted by
+  available rest_time (shift_weight).
+- FINGER: which finger got used, independent of stretch/shift.
+  Needed because `anchor = fret - (finger-1)` makes finger choice a
+  free variable otherwise -- the DP would use a far finger just to
+  fake a cheaper anchor for shift_cost. Originally priced as a FLAT
+  per-finger constant -- that was a real bug: a flat cost never
+  shrinks, but shift's physical distance does, so there was always
+  some fret position where relocating beat switching fingers purely
+  from a units mismatch. Pricing finger cost as a physical reach too
+  fixes that -- all three costs now shrink together, so the tradeoff
+  is decided by real rest_time, not raw position. technique_weight is
+  the one deliberate flat exception: it's a technique-difficulty
+  preference (e.g. pinky on a bend), not a spatial one.
+
+REST_TIME = the inter-onset interval (previous moment's duration),
+not literal silence -- how much time is available to move before the
+next note must sound.
+
+THE DP
+------
+Layer = moment. Node = one joint HandPosition assignment
+(candidate_assignments). Edge cost = transition_cost. solve() runs
+the standard forward pass (cheapest cost to reach each node, plus a
+back-pointer) then backtraces from the cheapest final node -- same
+shape as edit-distance / Viterbi, "hand shape" instead of "hidden
+state."
+
 """
 
 import itertools
@@ -110,61 +55,46 @@ from dataclasses import dataclass
 from src.moments import Moment
 from src.parser import Note, Technique
 
-# Bend-family techniques: all of these involve the fretting finger
-# actively pushing/holding the string under tension, which is the
-# physical motion that's awkward with the pinky.
-#
-# Note: as of this writing, parser.py's parse_line only ever attaches
+# parser.py's parse_line only ever attaches
 # ONE modifier token to a Note (whichever immediately follows its fret
 # token) -- so a real "bend then release" ("11b13r11") ends up with
 # modifier=BEND only; the RELEASE token is silently orphaned and
-# dropped before it ever reaches a Note. RELEASE/REBEND are included
-# here for correctness and for the standalone case ("11r9" with no
-# preceding "b"), but won't fire on the more common compound
-# bend-and-release pattern until that parser-level bug is fixed
-# separately. Not this file's bug to fix, but worth knowing why
-# RELEASE/REBEND may look like dead weight in testing until it is.
+# dropped before it ever reaches a Note. This is the limitation of this 
+# project's parser that's not really worth because of non-standardized tab notation, 
+# and the optimizer is written to handle it anyway: if a Note ever did carry both a BEND and a RELEASE
+# the optimizer would still treat it as a bend-family technique (the RELEASE is just a decoration on
+# top of the bend, not a separate physical motion).
 BEND_FAMILY = (Technique.BEND, Technique.PRE_BEND, Technique.REBEND, Technique.RELEASE)
 
-# Two separate magnitude-based cost tables, not one shared rank table.
-# A flat rank (0/1/2/3) forces equal spacing between every finger
-# step, which doesn't match real technique difficulty for either
-# technique, and the two techniques don't even share the same shape of
-# difficulty:
-#   - BEND_FINGER_COST: bending is a sustained strength/control
-#     problem (holding a string under tension in tune), and there's a
-#     real gradient to it -- ring is easiest (the two fingers behind it
+
+#     BEND_FINGER_COST: bending is a sustained strength/control
+#     problem (holding a string under tension in tune). 
+#     ring finger is usually easiest (the two fingers behind it
 #     on the neck can brace it), then middle, then index (weakest of
 #     the three without help behind it), with pinky a much BIGGER jump
 #     than the even spacing between the others (weakest finger
-#     overall, genuinely awkward to hold string tension with, not just
-#     "one more rank down").
-#   - VIBRATO_FINGER_COST: vibrato is an oscillation, not a sustained
-#     push, so it's close to finger-agnostic for index/middle/ring --
-#     the only real penalty is pinky.
+#     overall, unless you are like that one guy who can bend with his pinky, 
+#     in which case you are a freak and this project is not for you).
+#     VIBRATO_FINGER_COST: vibrato is an bascially good for all fingers
+#     except pinky. 
 # Both deliberately do NOT match the general `_finger_cost` baseline's
 # index-is-always-cheapest assumption -- that baseline is about
 # physical REACH from the anchor (index reaches furthest for free
 # because anchor is defined by it), which has nothing to do with which
 # finger has the STRENGTH/control to bend or oscillate a string well.
 # A lone bent note with plenty of rest_time around it should still
-# prefer ring over index even though index "reaches for free," because
-# bending isn't a reach problem, it's a strength problem.
-# These are starting values the project owner will tune by eye, not
-# measured constants.
+# prefer ring over index even though index "reaches for free"
+
 BEND_FINGER_COST = {3: 0.0, 2: 0.3, 1: 0.6, 4: 1.2}  # ring, middle, index, pinky
 VIBRATO_FINGER_COST = {3: 0.0, 2: 0.0, 1: 0.0, 4: 1.0}  # only pinky is penalized
 
-# Sliding lives on Note.arrival (how you got to this note), not
-# Note.modifier (how the note is decorated once you're on it) --
-# checking the wrong field would silently never match, same class of
-# bug as an earlier enum/string mismatch in this file. Bare
+# Sliding lives on Note.arrival (how you got to this note). Bare
 # Technique.SLIDE is included alongside SLIDE_UP/SLIDE_DOWN because
 # parser.py's parse_line only resolves "s" into a direction when
 # there's a prior note on the same string to compare against -- the
 # first note on a string with a leading "s" has no prior note yet and
-# can reach here still unresolved. Like vibrato, sliding is close to
-# finger-agnostic except for a pinky penalty.
+# can reach here still unresolved. Like vibrato, sliding good for all 
+# fingers except pinky.
 SLIDE_TECHNIQUES = (Technique.SLIDE_UP, Technique.SLIDE_DOWN, Technique.SLIDE)
 SLIDE_FINGER_COST = {3: 0.0, 2: 0.0, 1: 0.0, 4: 1.0}
 
@@ -189,7 +119,7 @@ def physical_fret_position(fret: float) -> float:
 
 
 def physical_distance(fret_a: float, fret_b: float) -> float:
-    """Physical distance between two frets, in the same scale-length units."""
+    # Physical distance between two frets, in the same scale-length units.
     return abs(physical_fret_position(fret_a) - physical_fret_position(fret_b))
 
 
@@ -204,7 +134,7 @@ class FingeringOptimizer:
     """
     Config:
       stretch_weight    -- cost per unit of physical spread WITHIN one
-                            moment's own hand shape (chord difficulty).
+                            moment's own hand shape (chord difficulty). #does this have vertical distance?
       shift_weight       -- cost per unit of physical distance the hand
                             anchor moves BETWEEN moments (position-change
                             difficulty), discounted by available rest time.
@@ -220,42 +150,6 @@ class FingeringOptimizer:
                             `physical_fret_position` law as stretch/shift,
                             not a flat per-finger-step count). Exists to
                             stop finger choice from being a free variable
-                            the DP can use to game shift_cost -- confirmed
-                            empirically: without this, an isolated
-                            high-fret note would get assigned to the
-                            pinky just to keep the anchor parked near a
-                            neighboring moment, not because the pinky was
-                            actually the natural choice there.
-
-                            AN EARLIER VERSION OF THIS PRICED IT AS A FLAT
-                            CONSTANT PER FINGER-STEP (e.g. pinky = 3 *
-                            finger_weight, unconditionally) -- that was
-                            wrong, not just imprecise: a flat constant
-                            never shrinks, but shift_cost's physical
-                            distance DOES shrink toward zero up the neck
-                            by construction (frets narrow toward the
-                            body). That mismatch meant there was always
-                            SOME fret position above which "relocate the
-                            whole hand with the index finger" was priced
-                            as cheaper than "stay anchored, use the ring
-                            finger" -- not because that's realistic, but
-                            purely because one cost was flat and the
-                            other wasn't. No single flat constant could
-                            fix this: lowering it to stop that just
-                            reintroduced the original pinky-hugging bug
-                            at LOW frets instead (confirmed: a sweep
-                            across finger_weight in [0.018, 0.02, 0.022]
-                            only moved the crossover fret up or down the
-                            neck, it never removed it). Pricing the
-                            reach in the SAME physical units as
-                            shift_cost fixes this structurally: both
-                            costs now shrink together at the same rate
-                            up the neck, so whether relocating beats
-                            finger-switching is driven by genuinely
-                            available `rest_time` (correct -- a real
-                            player WOULD relocate given enough time) not
-                            by raw fretboard position (a units-mismatch
-                            artifact).
       technique_weight   -- multiplier applied to the per-technique,
                             per-finger MAGNITUDE cost tables
                             (BEND_FINGER_COST, VIBRATO_FINGER_COST,
@@ -264,8 +158,7 @@ class FingeringOptimizer:
                             -- see those tables' own docstrings for why
                             bending gets a real gradient (ring best,
                             pinky a much bigger jump than the rest)
-                            while vibrato/slide are close to
-                            finger-agnostic except for pinky.
+                            while vibrato/slide is only for pinky.
       min_shift_discount -- floor on the rest_time discount applied to
                             shift_cost (see `transition_cost`).
                             rhythm.py's timing is a heuristic, not a
@@ -280,6 +173,9 @@ class FingeringOptimizer:
                             approximate timing data, not a claim that
                             hand movement has some true minimum
                             physical cost.
+                            this is a limitation because there is no strict bpm
+                            and rhythm recording in textual tabs, thus good conclusion
+                            cannot be drawn from this project about the actual time it takes to move the hand.
       slide_continuity_weight -- cost when a slide (`Note.arrival` in
                             SLIDE_TECHNIQUES) is assigned a DIFFERENT
                             finger than whatever was already on that
@@ -351,77 +247,37 @@ class FingeringOptimizer:
         finger is already resting nearby, so it isn't modeled as
         claiming a dedicated finger slot here.
 
-        FIXED BUG, not a tunable change: middle/ring/pinky each used to
-        get exactly ONE candidate anchor, at a fixed RAW offset from
-        the note's fret (index=0, middle=1, ring=2, pinky=3 frets back
-        — `anchor = note.fret - (finger - 1)`). That's wrong the same
-        way a flat-per-finger-step cost was wrong elsewhere in this
-        file (see the module docstring's "FINGER cost was originally a
-        flat per-finger-step constant" section): frets narrow toward
-        the body, so the SAME physical stretch a real hand can make
-        covers MORE raw frets up the neck than it does near the nut.
-        Confirmed empirically: a fret15+fret18 dyad (a 3-raw-fret gap,
-        physically trivial that high up) had ZERO feasible index+ring
-        combination at zero stretch cost under the old fixed offset —
-        only index+pinky could reach it, forcing the wrong finger into
-        a role a real player's ring finger handles easily up there.
-
-        The fix gives middle/ring/pinky a RANGE of valid anchors, not
-        one: starting at each finger's traditional raw offset (kept as
-        the floor — a real hand doesn't use ring to play a note index
-        could reach just as easily) and extending outward exactly as
-        far as that finger's PHYSICAL reach limit allows, using the
-        same principle `max_stretch_frets` already uses elsewhere in
-        this file — calibrated against the worst case, the nut
-        (`physical_distance(0, finger - 1)`), where raw-fret and
-        physical distance are closest together and the traditional
-        offset is most nearly correct. At low frets this reach limit
-        is barely wider than the traditional offset itself, so it
-        produces the exact SAME single candidate as before — verified,
-        not a behavior change there. Candidate counts legitimately grow
-        at high frets (more real options genuinely exist), which is
-        expected and still entirely tractable at solo-tab length.
+        Candidate counts grow at high frets (more real options genuinely exist), 
+        which is expected and still entirely tractable at solo-tab length.
 
         Index (finger 1) is excluded from this range logic on purpose:
         `anchor_fret` is DEFINED as wherever the index finger sits
-        (see the module docstring's "THE PHYSICAL MODEL" section) —
-        index always plays its own fret directly, that's not a
-        convention that should flex.
+        (see the module docstring's "THE PHYSICAL MODEL" section).
         """
         if note.fret <= 0:
             return [HandPosition(note=note, finger=None, anchor_fret=None)]
 
         options = [HandPosition(note=note, finger=1, anchor_fret=note.fret)]
         for finger in FINGERS[1:]:
-            # Calibrated the same way max_stretch_frets is calibrated
-            # elsewhere in this file: the physical distance this
-            # finger's traditional raw offset corresponds to at the
-            # worst-case position, the nut — never a raw fret-count.
-            max_reach = physical_distance(0, finger - 1)
+            # anchor is depended on the index position, thats why we are excluding index finger
+            # from the loop. in real playing, especially in higher frets, the index can sometimes
+            # reach a note that's 2-3 frets away, but in our model we are simplyifing it 
+            max_reach = physical_distance(0, finger - 1) 
+            # max reach acts as a ceiling measured from the nut to the finger
             offset = finger - 1  # traditional minimum, always kept as the floor
             while True:
                 anchor = note.fret - offset
                 if anchor < 0:
                     break  # can't reach this fret from any real hand position
-                # anchor == 0 is a real, valid hand position (right at
-                # the nut) -- e.g. fret 1 played with the middle
-                # finger, index resting near fret 0. It's distinct from
-                # an open string (fret 0 itself, handled entirely
-                # above and never reaches here): this is a FRETTED
-                # note, just played from the lowest possible position.
-                # Excluding it was an earlier bug -- two notes at the
-                # same low fret (a real pattern: Master of Puppets'
-                # gallop riff repeats fret 1 on two adjacent strings)
-                # would otherwise both be forced onto finger 1 with no
-                # alternative, making them un-fingerable as a pair even
-                # though a real player just uses two different fingers
-                # close to the nut.
                 if physical_distance(anchor, note.fret) > max_reach:
                     break  # past this finger's real physical reach limit at this position
                 options.append(HandPosition(note=note, finger=finger, anchor_fret=anchor))
-                offset += 1
+                offset += 1 # keep trying higher anchors until we hit the physical limit
         return options
 
+    # the returned inner list is a single joint assignment for the whole moment
+    # and it's a list because there can be multiple notes in one moment
+    # the returned outer list collects different combos of joint assignments for the same moment
     def candidate_assignments(self, moment: Moment) -> list[list[HandPosition]]:
         """
         Every physically valid way to assign fingers to ALL notes in
@@ -446,8 +302,7 @@ class FingeringOptimizer:
              PHYSICAL fret distance (see module docstring), not raw
              fret-count.
 
-        A moment with more DISTINCT fretted positions than 4 (found in
-        real data — e.g. a dense strummed chord, not a solo dyad)
+        A moment with more DISTINCT fretted positions than 4 
         can't satisfy rule 1 at all, by pigeonhole: there just aren't
         enough fingers, independent of stretch. That's genuinely out
         of this project's scope and, on a solo tab, almost certainly a
@@ -455,14 +310,10 @@ class FingeringOptimizer:
         the same way as the stretch fallback below: don't crash the
         whole song, use a placeholder, warn loudly.
 
-        NOTE ON RAW NOTE COUNT vs. DISTINCT FRET COUNT (a real bug,
-        found and fixed): an earlier version of this check rejected any
+        NOTE ON RAW NOTE COUNT vs. DISTINCT FRET COUNT 
+        an earlier version of this check rejected any
         moment with more than 4 fretted NOTES, full stop -- that's
-        wrong for a real full BARRE CHORD, which routinely sounds 5-6
-        strings with only 3-4 DISTINCT fret values (the barred fret
-        covers several strings under one finger, by rule 1's own barre
-        exception above; only the few "shape" notes on top of the barre
-        need their own separate fingers). Rejecting on raw note count
+        wrong for a real full BARRE CHORD. Rejecting on raw note count
         was throwing away exactly the cases the barre exception exists
         to solve -- a 6-note barre chord would get the crude
         every-note-gets-index placeholder below instead of ever
@@ -473,59 +324,53 @@ class FingeringOptimizer:
         exists at all, barre included -- true pigeonhole impossibility,
         not an approximation of it.
         """
+        
         per_note_options = [self._note_candidates(n) for n in moment.notes]
 
-        # `max_stretch_frets` is a fret-COUNT knob, but feasibility has
-        # to be judged in physical units. Calibrate it against the
-        # WIDEST possible spacing -- a span starting at the nut (fret
-        # 0) -- since that's the hardest-case stretch for a given
-        # fret-count. The payoff: a stretch of MORE than
-        # `max_stretch_frets` frets higher up the neck, where spacing
-        # is physically tighter, can still pass this check (correctly
-        # easier), while the same fret-count near the nut is right at
-        # the limit (correctly the hard case).
+        
         max_physical_stretch = physical_distance(0, self.max_stretch_frets - 1)
 
+        # plan b if no reachable combination exists
         finger_legal: list[tuple[HandPosition, ...]] = []
+        # plan a if a reachable combination exists
         reachable: list[list[HandPosition]] = []
 
+        # * unpacks the list of lists into separate arguments for product()
         for combo in itertools.product(*per_note_options):
             # A finger can be reused across notes in the same moment
-            # ONLY as a genuine barre: the same finger pressing the
-            # SAME fret on multiple strings at once (e.g. index finger
-            # flat across fret 7 on both the A and low-E strings) is
-            # exactly how real players cover this, not two separate
-            # fingers each fighting for their own anchor. Reusing a
-            # finger across two DIFFERENT frets is impossible (one
-            # finger can't be in two places at once) and stays
-            # rejected.
+            # ONLY as a barre: the same finger pressing the
+            # SAME fret on multiple strings
+            # Reusing a finger across two DIFFERENT frets is impossible 
+            # and is rejected
             finger_frets: dict[int, int] = {}
             barre_conflict = False
             for hp in combo:
                 if hp.finger is None:
                     continue
+                # check if finger is already used earlier in same combo
                 if hp.finger in finger_frets and finger_frets[hp.finger] != hp.note.fret:
                     barre_conflict = True
                     break
                 finger_frets[hp.finger] = hp.note.fret
+            # if we found a barre conflict, skip this combo and continue to the next one
             if barre_conflict:
                 continue
 
             finger_legal.append(combo)
 
             anchors = [hp.anchor_fret for hp in combo if hp.anchor_fret is not None]
+            # if there are 2+ anchors, calculate physical distance btw highest and lowest
+            # if there's only 1 anchor, spread is 0.0
             spread = physical_distance(max(anchors), min(anchors)) if len(anchors) >= 2 else 0.0
             if spread <= max_physical_stretch:
                 reachable.append(list(combo))
 
         if not finger_legal:
-            # Truly pigeonhole-impossible: even allowing every barre the
-            # rules above permit, more distinct frets need covering than
-            # there are fingers to cover them with. Confirmed via the
-            # actual search, not guessed from a raw note count (see the
-            # docstring above) -- e.g. 5+ genuinely different simultaneous
-            # fret positions, no barre can rescue that.
+            # If literally no combo survived the finger-conflict check at all
+            
+            # count how many notes in this moment are fretted (fret > 0)
             fretted_count = sum(1 for n in moment.notes if n.fret > 0)
+            # a fake placeholder assignment that uses index for every fretted note, and None for open strings
             placeholder = [
                 HandPosition(note=n, finger=1, anchor_fret=n.fret) if n.fret > 0
                 else HandPosition(note=n, finger=None, anchor_fret=None)
@@ -542,16 +387,9 @@ class FingeringOptimizer:
             )
             return [placeholder]
 
+        # If some combos were finger-legal but none fit within stretch range
         if not reachable:
-            # Every finger-legal combo needs more of a stretch than one
-            # hand can comfortably cover. Almost certainly either (a) a
-            # moments.py grouping artifact -- two notes that were never
-            # really simultaneous, just close enough in column to pass
-            # `tolerance` -- or (b) a genuinely wide chord voicing, out
-            # of this project's scope (see PLAN.md exclusions). Don't
-            # crash the whole song over one bad moment: fall back to the
-            # least-stretched option anyway, and say so loudly, same
-            # "tell, don't hide" approach as the rest of this project.
+            # Pick whichever finger-legal combo has the smallest stretch
             best = min(
                 finger_legal,
                 key=lambda combo: (
@@ -560,6 +398,7 @@ class FingeringOptimizer:
                 ),
             )
             notes_desc = [(n.string_name, n.fret) for n in moment.notes]
+            # readable description of the notes involved, and print a warning explaining that no combo comfortably fits
             print(
                 f"WARNING: column {moment.column}: no finger combination for "
                 f"this moment fits within one hand span (max_stretch_frets="
@@ -568,72 +407,49 @@ class FingeringOptimizer:
                 f"this moment against the original tab, it may not really be "
                 f"simultaneous."
             )
+            # Set reachable to just this one best-effort combo, so the function still has something to return
             reachable = [list(best)]
 
         return reachable
 
+    # to_assignment is a list of HandPosition, one per note in the moment.
+    # to_assignment acts as a NODE
+    # to_assignment is the candidate of CURRENT moment
+    # from_assignment is the candidate of PREVIOUS moment
     def _finger_cost(self, to_assignment: list[HandPosition]) -> float:
         """
-        Flat preference over finger IDENTITY, independent of stretch or
-        shift. This is not a physical-distance measurement (unlike
-        stretch/shift) -- it's what stops finger choice from being a
-        free variable.
+    Cost for finger identity, independent of stretch/shift -- stops
+    the DP from picking an unrealistic finger just to cheapen
+    shift_cost (see finger_weight's docstring in __init__).
 
-        Confirmed empirically before this existed: because
-        `anchor = fret - (finger - 1)`, the DP could reassign a lone
-        note's finger purely to relocate its anchor closer to a
-        neighboring moment's anchor, making shift_cost artificially
-        cheap without the finger choice reflecting anything about how
-        a real hand would actually play it (e.g. a single note at fret
-        17 assigned to the pinky, anchor 14, just to avoid moving the
-        hand -- confirmed via test_behavior.py before this fix, gone
-        after it).
-
-        Two components:
-          - baseline: `finger_weight` times the PHYSICAL distance from
-            the moment's anchor to this note's actual fret (0 for
-            index, since anchor is literally defined as index's own
-            fret -- see `finger_weight`'s docstring in `__init__` for
-            why this replaced an earlier flat per-finger-step version
-            that was a real bug, not just a rougher approximation).
-          - technique: an EXTRA charge, scaled by `technique_weight`,
-            for bend-family/vibrato/slide notes, using per-technique
-            magnitude-based cost tables (BEND_FINGER_COST,
-            VIBRATO_FINGER_COST, SLIDE_FINGER_COST at module level --
-            see their docstrings there for why bending gets a real
-            gradient while vibrato/slide are close to finger-agnostic
-            except for pinky). This is a real preference order, not
-            just "avoid the pinky": bending is a STRENGTH/control
-            problem (which finger can push a string in tune, braced by
-            the fingers behind it), not the reach problem the baseline
-            above prices, so it can cost index (which the baseline
-            treats as free) MORE than ring for a bend even though index
-            reaches its own fret at zero physical cost. Priced on top
-            of, not instead of, the baseline. Left as flat constants on
-            purpose, same as before: unlike the baseline, these aren't
-            standing in for a physical reach, they're technique-
-            difficulty preferences (a ring-finger bend isn't
-            meaningfully easier at fret 5 than at fret 15), so there's
-            no physical-distance law they should be shrinking to match.
-            The bend check and the vibrato check are mutually exclusive
-            (`elif`) since both live on the same `Note.modifier` field
-            and a note can only carry one modifier. The slide check is
-            a separate, independent `if`: sliding lives on
-            `Note.arrival` (how you got to this note), not `modifier`
-            (how it's decorated once you're on it) -- a note's arrival
-            and modifier are independent fields and can both apply to
-            the same note (e.g. slide into a bend), so it isn't an
-            `elif` off the other two.
+    Two parts per note:
+      - baseline: finger_weight * physical reach from anchor to fret
+        (0 for index, since anchor IS index's fret).
+      - technique: extra cost for bend/vibrato/slide, from the
+        magnitude tables above. Bend/vibrato share Note.modifier
+        (elif -- mutually exclusive); slide is Note.arrival, a
+        separate field that can co-occur with either (plain if).
         """
         cost = 0.0
         for hp in to_assignment:
+           # skip open strings and muted notes
+            # Not zero at a finger's own canonical offset (eg. ring at 2) on purpose:
+        # tried charging only for reach BEYOND canonical, and 
+        # any nut-calibrated budget hits zero marginal cost at high
+        # enough frets, so the hand just parks and stretches forever
+        # with progressively higher fingers, for free (a
+        # 12->14->15->17 climb never moved at all--although its possible. 
+        # Charging the FULL reach, always, is what keeps that loophole closed.
+
             if hp.finger is None or hp.anchor_fret is None:
                 continue
             cost += self.finger_weight * physical_distance(hp.anchor_fret, hp.note.fret)
+            # a note can only have 1 modifier
             if hp.note.modifier in BEND_FAMILY:
                 cost += self.technique_weight * BEND_FINGER_COST[hp.finger]
             elif hp.note.modifier == Technique.VIBRATO:
                 cost += self.technique_weight * VIBRATO_FINGER_COST[hp.finger]
+            # a note can have slide on top of other modifiers
             if hp.note.arrival in SLIDE_TECHNIQUES:
                 cost += self.technique_weight * SLIDE_FINGER_COST[hp.finger]
         return cost
@@ -644,27 +460,15 @@ class FingeringOptimizer:
         to_assignment: list[HandPosition],
     ) -> float:
         """
-        A slide is one continuous motion of a single finger sliding
-        along the string, not a reposition -- you cannot switch which
-        finger is pressing down partway through. If `to_assignment`
-        puts a DIFFERENT finger on a slide note than whichever finger
-        was on that same string a moment ago, that's not a real slide
-        at all, so it's charged `slide_continuity_weight`. This is
-        distinct from `_finger_cost`'s SLIDE_FINGER_COST, which prices
-        WHICH finger is doing the sliding (pinky worse); this prices
-        whether the finger is even the SAME one as before, which
-        `_finger_cost` has no way to know (it only ever looks at
-        `to_assignment` in isolation, never the previous moment).
-
-        Priced high, same as `_legato_conflict_cost` below: this is
-        close to a hard physical constraint, not a soft comfort
-        preference, so it should only ever lose to an option that's
-        even worse (e.g. the origin note genuinely isn't reachable by
-        any single finger available, a data problem upstream, not
-        something this cost is meant to paper over).
+    A slide needs the same finger as whatever was on that string a
+    moment ago. You can't switch mid-slide. Priced high (near-hard
+    constraint), same as _legato_conflict_cost below.
         """
+        # if theres no previous note
         if not from_assignment:
             return 0.0
+        # this is shortened def of dictionary
+        # in form of {string_name: finger}
         from_finger_by_string = {
             hp.note.string_name: hp.finger for hp in from_assignment if hp.finger is not None
         }
@@ -683,17 +487,12 @@ class FingeringOptimizer:
         to_assignment: list[HandPosition],
     ) -> float:
         """
-        The opposite requirement from sliding: a hammer-on or pull-off
-        needs a SECOND finger, distinct from whatever finger is already
-        down on that string, because that first finger is what's
-        sounding (or was just sounding) the origin note. If
-        `to_assignment` reuses the SAME finger that was on that string
-        a moment ago for a hammer-on/pull-off note, that's not
-        physically playable as a legato move, so it's charged
-        `legato_conflict_weight`.
+        Opposite of sliding: hammer-on/pull-off needs a different finger
+        from whatever was on that string a moment ago.
         """
         if not from_assignment:
             return 0.0
+        
         from_finger_by_string = {
             hp.note.string_name: hp.finger for hp in from_assignment if hp.finger is not None
         }
@@ -712,32 +511,16 @@ class FingeringOptimizer:
         to_assignment: list[HandPosition],
     ) -> float:
         """
-        A stricter, SEPARATE check that applies only to PULL_OFF, not
-        HAMMER_ON. A pull-off requires the destination finger to
-        already be resting on the string BEFORE the origin note
-        releases -- both fingers coexist on the fretboard for an
-        instant, like a phantom two-note chord, even though only one
-        note sounds at a time. That means the origin and destination
-        frets must be within one hand's real physical reach of each
-        other -- the same stretch-feasibility test
-        `candidate_assignments` already runs for a genuine simultaneous
-        dyad, just applied here across a moment boundary instead of
-        within one moment. Hammer-on has no equivalent requirement:
-        the hammering finger can arrive fresh, it doesn't need to
-        already be in position.
-
-        Scaled by how far PAST one hand's reach the two frets are, not
-        a flat penalty -- a marginal overreach costs less than a
-        genuinely impossible one (e.g. a written "pull-off" spanning
-        12 frets, which likely indicates a moments.py grouping issue
-        or a parser misread rather than a real playable pull-off, and
-        should be priced as unmistakably bad, not just mildly
-        discouraged).
+        Why: pull off destination finger must already be on the string
+        before the origin note releases, so the two frets must be within
+        one hand's reach. 
+        this cost scales by overage (how far past the hand's reach the two frets are).
         """
         if not from_assignment:
             return 0.0
         max_physical_stretch = physical_distance(0, self.max_stretch_frets - 1)
         from_by_string = {
+            # map to HandPosition because we need anchor_fret too
             hp.note.string_name: hp for hp in from_assignment if hp.anchor_fret is not None
         }
         cost = 0.0
@@ -745,6 +528,7 @@ class FingeringOptimizer:
             if hp.anchor_fret is None or hp.note.arrival != Technique.PULL_OFF:
                 continue
             prior_hp = from_by_string.get(hp.note.string_name)
+            # if it's an open string or silent before
             if prior_hp is None:
                 continue
             span = physical_distance(prior_hp.anchor_fret, hp.anchor_fret)
@@ -759,10 +543,8 @@ class FingeringOptimizer:
         rest_time: float,
     ) -> float:
         """
-        Cost to move from `from_assignment`'s hand shape to
-        `to_assignment`'s, given `rest_time` seconds available to make
-        the move (the inter-onset interval -- see module docstring for
-        why that's the right quantity, not literal silence).
+        given previous moment and current moment's hand position assignment, 
+        how much rest time is available, then return the total cost of transition
 
         `from_assignment == []` means "cold start" (no prior hand
         position, e.g. the very first moment of the song) -- shift cost
@@ -802,6 +584,8 @@ class FingeringOptimizer:
             # nothing to measure a physical shift against.
             shift_cost = 0.0
         else:
+            # ex: if both index and middle are in fret 5, then their anchor is 5 and maybe 6
+            # average anchor is 5.5 then.
             from_pos = sum(from_anchors) / len(from_anchors)
             to_pos = sum(to_anchors) / len(to_anchors)
             shift_distance = physical_distance(from_pos, to_pos)
@@ -839,23 +623,25 @@ class FingeringOptimizer:
         notes later without ever explicitly looking ahead itself,
         because the DP already explored every path before committing.
         """
+        # nothing to solve for empty song
         if not moments:
             return []
 
         for m in moments:
             if m.start_time is None or m.duration is None:
                 raise ValueError(
-                    f"Moment at column {m.column} has no start_time/duration -- "
+                    f"Moment at column {m.column} has no start_time/duration. "
                     f"run rhythm.assign_timing() before optimizer.solve()."
                 )
-
+        # 3 layers of list comprehension: outer = moments, middle = candidate assignments for 
+        # that moment, inner = HandPosition for each note in that assignment
         layer_candidates = [self.candidate_assignments(m) for m in moments]
         for i, cands in enumerate(layer_candidates):
             if not cands:
                 # Every path through candidate_assignments (normal,
                 # too-wide-a-stretch fallback, too-many-fingers
                 # fallback) returns at least one candidate -- this
-                # should be unreachable. Fail loudly with the moment
+                # should be unreachable. Fail with the moment
                 # that broke the invariant rather than a cryptic
                 # IndexError several stack frames later in the
                 # backward trace.
@@ -865,9 +651,14 @@ class FingeringOptimizer:
                     f"in candidate_assignments, not a data problem."
                 )
 
+        # stores each layer's candidate assignment costs, and the 
+        # backtrace pointers to the previous layer's best candidate
         dp_cost: list[list[float]] = [
             [self.transition_cost([], cand, rest_time=0.0) for cand in layer_candidates[0]]
         ]
+        # pointer to which candidate in the previous layer was cheapest for each candidate in this layer
+        # the value is which candidate number, in the previous moment, was the cheapest
+        # thing to come from
         dp_back: list[list[int | None]] = [[None] * len(layer_candidates[0])]
 
         for i in range(1, len(moments)):

@@ -1,13 +1,12 @@
 """
 parser.py
 
-Converts plain-text guitar tabs (copied from Ultimate Guitar or similar)
-into a list of structured Note objects that a fingering optimizer can
-consume.
+Converts plain-text guitar tabs into a list of structured Note objects 
+that a fingering optimizer can consume.
 
 MODEL OF A TAB FILE
 --------------------
-A tab file is not one continuous grid. It's a series of "blocks" — groups
+A tab file is not one continuous grid. It's a series of "blocks": groups
 of 6 lines (one per string) that get reset every ~20-40 characters so the
 tab fits on screen. Between blocks there's usually a blank line, a chord
 name, a section label ("[Chorus]"), or lyrics.
