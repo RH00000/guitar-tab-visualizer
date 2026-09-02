@@ -36,19 +36,13 @@ ALLOWED_CONTENT_CHARS = set("-0123456789hHpPxXbBsS/\\~()^|")
 # where two single-digit notes got typed with no separating dash.
 MAX_REALISTIC_FRET = 24
 
-# How far to run an INDEFINITE slide ("10/" — a slide with a direction
-# but no destination fret) when synthesizing its missing destination
-# Note. Mirrors visualizer.py's/audio.py's UNANCHORED_SLIDE_RUN_FRETS,
-# which solves a related-but-different problem (an existing note with
-# nowhere to glide FROM, for rendering) — this constant is this file's
-# own, for the case of a note that doesn't exist yet at all. Kept as
-# the same value on purpose, for one consistent "how far is an
-# unspecified slide" answer across the whole pipeline.
+# how far to run an indefinite slide when no target fret is given 
+# intentionally kept as a constant to make it easy to change in one place if a different default is desired
 INDEFINITE_SLIDE_RUN_FRETS = 8
 
 
 class Technique(Enum):
-    NONE = "none"
+    NONE = "none"   
     HAMMER_ON = "hammer_on"
     PULL_OFF = "pull_off"
     SLIDE_UP = "slide_up"
@@ -72,9 +66,7 @@ ARRIVAL_CHARS = {
 }
 
 # Characters that decorate a note that was ALREADY played, rather than
-# describing a transition to a new one. Vibrato has no target; bend does
-# ("5b7" = bend fret 5 up until it sounds like fret 7 — this is still ONE
-# physical note, not two).
+# describing a transition to a new one. Vibrato has no target.
 MODIFIER_CHARS = {"~": Technique.VIBRATO}  # "b" is handled specially below
 
 
@@ -219,11 +211,7 @@ def parse_line(content: str, string_index: int, string_name: str) -> list[Note]:
             # Real guitars top out around 24 frets. Real tabs sometimes
             # have two separate single-digit notes typed with no dash
             # between them (a formatting slip in the source, common in
-            # scraped/copy-pasted tabs). Without this check, "1197" reads
-            # as fret 1197 — impossible, and silently wrong. So: consume
-            # at most 2 digits, and if those 2 digits form a number over
-            # MAX_REALISTIC_FRET, back off and treat it as two separate
-            # single-digit notes instead.
+            # scraped/copy-pasted tabs).
             if i < n and content[i].isdigit():
                 two_digit_value = int(digits + content[i])
                 if two_digit_value <= MAX_REALISTIC_FRET:
@@ -432,12 +420,7 @@ def parse_block(block_lines: list[str]) -> tuple[list[Note], int]:
         stripped = raw_line.strip()
 
         # Match the leading letter itself (e/B/G/D/A/E), regardless of
-        # whether it's followed by "|", ":", or nothing at all. Real tabs
-        # are inconsistent about the delimiter, and getting the STRING
-        # NAME WRONG is a much worse bug than getting the delimiter
-        # character wrong — it silently assigns notes to the wrong pitch.
-        # Only fall back to position-based guessing when there's truly no
-        # letter to read.
+        # whether it's followed by "|", ":", or nothing at all.
         label_match = re.match(r'^([A-Ga-g])(#|b)?', stripped)
         if label_match:
             string_name = label_match.group(1)
@@ -446,7 +429,7 @@ def parse_block(block_lines: list[str]) -> tuple[list[Note], int]:
                 rest = rest[1:]
             content = rest
         else:
-            # No label found — fall back to standard top-to-bottom order.
+            # No label found . fall back to standard top-to-bottom order.
             # This will misbehave on 7-string or drop-tuned tabs with no
             # labels; flagged as a known limitation below.
             string_name = STANDARD_TUNING_ORDER[i] if i < len(STANDARD_TUNING_ORDER) else f"string{i}"
@@ -464,7 +447,7 @@ def parse_tab(raw_text: str) -> list[Note]:
     """
     Top-level entry point. Splits the raw file into blocks, parses each,
     and stitches column indices together so columns are unique across the
-    ENTIRE song, not just within one block.
+    entire song, not just within one block.
     """
     lines = raw_text.split("\n")
     blocks = group_into_blocks(lines)
@@ -481,28 +464,3 @@ def parse_tab(raw_text: str) -> list[Note]:
 
     return all_notes
 
-
-if __name__ == "__main__":
-    # Small hand-checkable sample covering: plain notes, multi-digit frets,
-    # hammer-on, pull-off, slide, and a bend with target. Trace through
-    # parse_line by hand once — it's the only way to trust this file.
-    sample = """
-e|--5h7---7p5--10-12/14--|
-B|------------------------|
-G|------------------------|
-D|------------------------|
-A|------------------------|
-E|------------------------|
-
-e|--0----0-------0--|
-B|----1------1-------|
-G|-------0------------|
-D|--------------------|
-A|--------------------|
-E|--------------------|
-""".strip("\n")
-
-    notes = parse_tab(sample)
-    notes.sort(key=lambda note: note.column)
-    for note in notes:
-        print(note)
