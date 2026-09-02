@@ -85,19 +85,3 @@ def assign_timing(
             moment.duration = seconds_per_column * 4
 
     return moments
-
-
-if __name__ == "__main__":
-    from src.parser import Note
-
-    sample_notes = [
-        Note(string_index=0, string_name="e", fret=5, column=2),
-    ]
-    sample_moments = [
-        Moment(notes=sample_notes, column=2),
-        Moment(notes=sample_notes, column=10),
-        Moment(notes=sample_notes, column=14),
-    ]
-
-    for m in assign_timing(sample_moments):
-        print(f"Moment(col={m.column}): start={m.start_time:.2f}s duration={m.duration:.2f}s")
