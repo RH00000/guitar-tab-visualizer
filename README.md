@@ -25,7 +25,7 @@ The pipeline is four steps, each one a separate file:
 
 All of the distance math accounts for the fact that frets get physically narrower the higher up the neck you go: a two-fret stretch at fret 2 is a real reach, the same two frets at fret 15 is nothing. Treating every fret gap as equal-sized would have thrown off both the stretch and shift costs.
 
-**5. Visualizer** — takes the optimizer's output and animates it on a fretboard, showing which finger lands where as the song plays.
+**5. Visualizer**: takes the optimizer's output and animates it on a fretboard, showing which finger lands where as the song plays.
 
 ## About the audio 
 
